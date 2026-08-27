@@ -20,6 +20,7 @@ import subprocess
 import sys
 import time
 import urllib.parse
+import urllib.request
 from dataclasses import dataclass
 from html.parser import HTMLParser
 from pathlib import Path, PurePosixPath
@@ -142,7 +143,7 @@ def connect_wiz_browser(args: argparse.Namespace, initial_url: str = WIZ_APP_URL
 
 WIZ_HELPER_JS = r"""
 (() => {
-  if (window.__wandaoWiz && window.__wandaoWiz.version === 1) return true;
+  if (window.__wandaoWiz && window.__wandaoWiz.version === 2) return true;
 
   const reqToPromise = (req) => new Promise((resolve, reject) => {
     req.onsuccess = () => resolve(req.result);
@@ -321,13 +322,24 @@ WIZ_HELPER_JS = r"""
     };
   };
 
+  const beginImageLoad = (url) => {
+    const key = `wandao-image-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+    window.__wandaoWizImages = window.__wandaoWizImages || {};
+    const image = new Image();
+    image.decoding = "async";
+    image.src = String(url || "");
+    window.__wandaoWizImages[key] = image;
+    return key;
+  };
+
   window.__wandaoWiz = {
-    version: 1,
+    version: 2,
     snapshot,
     noteDownload,
     otDoc,
     resourceCache,
     fetchBase64,
+    beginImageLoad,
   };
   return true;
 })()
@@ -595,9 +607,95 @@ class ResourceSaver:
         expression = f"window.__wandaoWiz.fetchBase64({js_string(url)})"
         return self.cdp.evaluate(expression, timeout=120)
 
+    def fetch_base64_via_browser(self, url: str) -> dict[str, Any]:
+        """Load an image as the logged-in browser and read its CDP response body."""
+        self.cdp.send("Network.enable", {}, timeout=10)
+        self.cdp.send("Network.setCacheDisabled", {"cacheDisabled": True}, timeout=10)
+        self.cdp.evaluate(f"window.__wandaoWiz.beginImageLoad({js_string(url)})", timeout=10)
+        response_event = self.cdp.wait_for_event(
+            "Network.responseReceived",
+            timeout=30,
+            predicate=lambda event: (
+                str(event.get("params", {}).get("response", {}).get("url") or "") == url
+                and str(event.get("params", {}).get("type") or "").lower() in {"image", "media"}
+            ),
+        )
+        params = response_event.get("params") or {}
+        request_id = str(params.get("requestId") or "")
+        response = params.get("response") or {}
+        status = int(response.get("status") or 0)
+        while 300 <= status < 400:
+            response_event = self.cdp.wait_for_event(
+                "Network.responseReceived",
+                timeout=30,
+                predicate=lambda event: str(event.get("params", {}).get("requestId") or "") == request_id,
+            )
+            response = (response_event.get("params") or {}).get("response") or {}
+            status = int(response.get("status") or 0)
+        headers = response.get("headers") or {}
+        content_type = str(response.get("mimeType") or next((value for key, value in headers.items() if str(key).lower() == "content-type"), ""))
+        if status < 200 or status >= 300:
+            raise ExportError(f"图片响应 HTTP {status}")
+        if not content_type.lower().startswith("image/"):
+            raise ExportError("浏览器响应不是图片")
+        try:
+            failed = self.cdp.wait_for_event(
+                "Network.loadingFailed",
+                timeout=0.1,
+                predicate=lambda event: str(event.get("params", {}).get("requestId") or "") == request_id,
+            )
+        except Exception:
+            failed = None
+        if failed:
+            error_text = str((failed.get("params") or {}).get("errorText") or "图片加载失败")
+            raise ExportError(error_text)
+        try:
+            self.cdp.wait_for_event(
+                "Network.loadingFinished",
+                timeout=30,
+                predicate=lambda event: str(event.get("params", {}).get("requestId") or "") == request_id,
+            )
+        except Exception:
+            for event in getattr(self.cdp, "pending_events", []):
+                event_params = event.get("params") or {}
+                if event.get("method") == "Network.loadingFailed" and str(event_params.get("requestId") or "") == request_id:
+                    raise ExportError(str(event_params.get("errorText") or "图片加载失败"))
+            raise
+        body = self.cdp.send("Network.getResponseBody", {"requestId": request_id}, timeout=30).get("result") or {}
+        raw = str(body.get("body") or "")
+        if not raw:
+            raise ExportError("浏览器没有返回图片响应体")
+        if not body.get("base64Encoded"):
+            raw = base64.b64encode(raw.encode("latin-1")).decode("ascii")
+        return {"base64": raw, "contentType": content_type, "finalUrl": str(response.get("url") or url)}
+
     def fetch_cache_base64(self, name: str) -> dict[str, Any] | None:
         expression = f"window.__wandaoWiz.resourceCache({js_string(name)})"
         return self.cdp.evaluate(expression, timeout=60)
+
+    def fetch_external_base64(self, url: str) -> dict[str, Any]:
+        """Read a public external image when its host rejects the browser fallback."""
+        request = urllib.request.Request(
+            url,
+            headers={
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/151 Safari/537.36",
+                "Referer": self.kb_server + "/",
+            },
+        )
+        with urllib.request.urlopen(request, timeout=30) as response:
+            status = int(getattr(response, "status", 200) or 200)
+            if status < 200 or status >= 300:
+                raise ExportError(f"图片响应 HTTP {status}")
+            headers = getattr(response, "headers", {})
+            content_type = str(headers.get("Content-Type") or headers.get("content-type") or "")
+            body = response.read()
+        if not body:
+            raise ExportError("HTTP 图片响应体为空")
+        return {
+            "base64": base64.b64encode(body).decode("ascii"),
+            "contentType": content_type,
+            "finalUrl": url,
+        }
 
     def save_data(self, key: str, name: str, payload: dict[str, Any], alt: str = "") -> str:
         if key in self.saved:
@@ -624,8 +722,17 @@ class ResourceSaver:
         url = self.build_collab_url(src)
         try:
             payload = self.fetch_base64(url)
-        except Exception:
-            payload = self.fetch_cache_base64(src)
+        except Exception as browser_exc:
+            try:
+                payload = self.fetch_base64_via_browser(url)
+            except Exception as browser_exc:
+                try:
+                    payload = self.fetch_cache_base64(src)
+                except Exception:
+                    payload = None
+                if not payload:
+                    self.failures.append({"url": url, "error": f"浏览器兜底失败：{browser_exc}"})
+                    return ""
         if not payload:
             self.failures.append({"url": url, "error": "图片下载失败"})
             return ""
@@ -646,8 +753,20 @@ class ResourceSaver:
             payload = self.fetch_base64(url)
             return self.save_data(key, Path(PurePosixPath(urllib.parse.urlparse(url).path).name).name or src, payload, alt)
         except Exception as exc:  # noqa: BLE001 - keep exporting the note body.
-            self.failures.append({"url": url, "error": str(exc)})
-            return ""
+            try:
+                payload = self.fetch_base64_via_browser(url)
+                return self.save_data(key, Path(PurePosixPath(urllib.parse.urlparse(url).path).name).name or src, payload, alt)
+            except Exception as browser_exc:
+                parsed = urllib.parse.urlparse(url)
+                wiz_host = urllib.parse.urlparse(self.kb_server).netloc.lower()
+                if parsed.scheme in {"http", "https"} and parsed.netloc.lower() != wiz_host:
+                    try:
+                        payload = self.fetch_external_base64(url)
+                        return self.save_data(key, Path(PurePosixPath(parsed.path).name).name or src, payload, alt)
+                    except Exception:
+                        pass
+                self.failures.append({"url": url, "error": str(browser_exc or exc)})
+                return ""
 
 
 def blocks_to_markdown(doc: WizDoc, blocks: list[dict[str, Any]], saver: ResourceSaver) -> str:
@@ -704,6 +823,18 @@ def blocks_to_markdown(doc: WizDoc, blocks: list[dict[str, Any]], saver: Resourc
     if text and not re.match(r"^#\s+", text):
         text = f"# {doc.title}\n\n{text}"
     return text + "\n" if text else f"# {doc.title}\n"
+
+
+def is_explicitly_empty_note_html(value: str) -> bool:
+    """Recognize Wiz's successful empty-note markup without accepting unknown content."""
+    source = html.unescape(str(value or ""))
+    source = re.sub(r"<!--.*?-->", "", source, flags=re.S)
+    if not source.strip() or not re.search(r"<\s*(?:p|div|br)\b", source, flags=re.I):
+        return False
+    if re.search(r"<\s*(?:img|table|object|iframe|audio|video)\b", source, flags=re.I):
+        return False
+    text = re.sub(r"<[^>]*>", "", source)
+    return not text.replace("\xa0", " ").strip()
 
 
 class WizHtmlToMarkdown(HTMLParser):
@@ -898,6 +1029,9 @@ def export_doc(cdp: CDPClient, snapshot: dict[str, Any], doc: WizDoc, md_path: P
         if ot_data and isinstance(ot_data.get("blocks"), list):
             markdown = blocks_to_markdown(doc, ot_data.get("blocks") or [], saver)
 
+    if not markdown and is_explicitly_empty_note_html(html_text):
+        markdown = f"# {doc.title}\n"
+
     if not markdown:
         raise ExportError("未能读取正文，可能是笔记尚未同步或登录态已失效。")
 
@@ -943,6 +1077,15 @@ def select_wiz_documents(docs: list[WizDoc], selected_doc_ids: set[str] | None =
             "请重新读取目录后再试。未匹配 ID：" + preview
         )
     return selected
+
+
+def should_skip_existing_doc(*, incremental: bool, path_exists: bool, retry_failed: bool) -> bool:
+    """Skip an existing Markdown file only during a normal incremental export.
+
+    A retry of a failed document must run the exporter again so failed images
+    (or other resources) get another download attempt.
+    """
+    return bool(incremental and path_exists and not retry_failed)
 
 
 def export_wiz(args: argparse.Namespace) -> dict[str, Any]:
@@ -1002,7 +1145,11 @@ def export_wiz(args: argparse.Namespace) -> dict[str, Any]:
                 if checkpoint and getattr(args, "resume", False) and checkpoint.item_status(item_key) == "completed":
                     skipped += 1
                     continue
-                if args.incremental and md_path.exists():
+                if should_skip_existing_doc(
+                    incremental=bool(args.incremental),
+                    path_exists=md_path.exists(),
+                    retry_failed=bool(getattr(args, "retry_failed", False)),
+                ):
                     if checkpoint:
                         checkpoint.complete_item(item_key, local_path=str(md_path), metadata={"docGuid": doc.doc_guid, "skippedExisting": True})
                     skipped += 1
