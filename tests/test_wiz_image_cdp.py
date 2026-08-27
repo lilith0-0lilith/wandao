@@ -57,7 +57,7 @@ class WizImageCdpTests(unittest.TestCase):
                 return b"png"
 
         with patch("plugins.wiz.backend.export_wiz.urllib.request.urlopen", return_value=Response()) as opened:
-            result = saver.save_normal_image("https://gips1.baidu.com/image.png", "image")
+            result = saver.save_normal_image("https://images.example.invalid/image.png", "image")
         self.assertTrue(result)
         opened.assert_called_once()
 
