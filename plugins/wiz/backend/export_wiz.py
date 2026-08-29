@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import argparse
 import base64
+import hashlib
 import html
 import json
 import mimetypes
@@ -30,6 +31,7 @@ from wandao_core.browser import (
     CDPClient,
     ExportError,
     ExportStopped,
+    check_stopped,
     chrome_debug_available,
     default_data_dir,
     emit,
@@ -51,6 +53,15 @@ DEFAULT_PROFILE = ".wiz-chrome-profile"
 DEFAULT_AUTH_FILE = ".wiz_auth.json"
 WIZ_APP_URL = "https://www.wiz.cn/xapp"
 FORBIDDEN_FILENAME_CHARS = r'<>:"/\|?*'
+WIZ_NOTE_DOWNLOAD_TIMEOUT = 12.0
+WIZ_EMPTY_BODY_RETRY_TIMEOUT = 4.0
+WIZ_EMPTY_BODY_RETRY_DELAY = 0.4
+WIZ_OT_DOCUMENT_TIMEOUT = 6.0
+WIZ_PAGE_HEALTH_TIMEOUT = 2.0
+WIZ_PAGE_RECOVERY_LOGIN_TIMEOUT = 20
+WIZ_IMAGE_TOTAL_TIMEOUT = 12.0
+WIZ_IMAGE_PRIMARY_TIMEOUT = 8.0
+WIZ_EXTERNAL_IMAGE_TIMEOUT = 8.0
 
 
 @dataclass
@@ -74,6 +85,14 @@ class WizFolder:
     parent_location: str
     position: int
     note_count: int
+
+
+class WizPageSessionLost(ExportError):
+    """The Wiz tab is reachable through CDP but its readonly jobs no longer finish."""
+
+
+class WizPageSessionUnrecoverable(ExportError):
+    """A fresh readonly Wiz tab could not restore the current export."""
 
 
 def default_profile_path() -> Path:
@@ -102,6 +121,20 @@ def markdown_link_path(value: str) -> str:
     return value.replace("\\", "/").replace(" ", "%20")
 
 
+def safe_resource_url(value: str) -> str:
+    """Keep credentials and tracking parameters out of checkpoint records."""
+    parsed = urllib.parse.urlsplit(str(value or ""))
+    return urllib.parse.urlunsplit((parsed.scheme, parsed.netloc, parsed.path, "", ""))
+
+
+def wiz_resource_key(doc: WizDoc, resource_type: str, source: str) -> str:
+    source = str(source or "").strip()
+    if not source:
+        return ""
+    digest = hashlib.sha256(source.encode("utf-8")).hexdigest()[:20]
+    return f"wiz:doc:{doc.doc_guid}:{resource_type}:{digest}"
+
+
 def js_string(value: str) -> str:
     return json.dumps(value, ensure_ascii=False)
 
@@ -115,14 +148,39 @@ def page_for_wiz(port: int) -> dict[str, Any] | None:
     return None
 
 
-def connect_wiz_browser(args: argparse.Namespace, initial_url: str = WIZ_APP_URL) -> tuple[CDPClient, subprocess.Popen[Any] | None]:
+def open_fresh_wiz_page(port: int, initial_url: str) -> dict[str, Any]:
+    """Open a new Wiz target instead of reconnecting to a stalled renderer."""
+    existing_ids = {
+        str(page.get("id") or "")
+        for page in http_json(f"http://127.0.0.1:{port}/json/list", timeout=5)
+    }
+    open_tab(port, initial_url)
+    deadline = time.time() + 10
+    while time.time() < deadline:
+        for page in http_json(f"http://127.0.0.1:{port}/json/list", timeout=5):
+            if (
+                page.get("type") == "page"
+                and "wiz.cn" in str(page.get("url") or "")
+                and str(page.get("id") or "") not in existing_ids
+            ):
+                return page
+        time.sleep(0.2)
+    raise ExportError("无法创建新的为知笔记网页标签页。")
+
+
+def connect_wiz_browser(
+    args: argparse.Namespace,
+    initial_url: str = WIZ_APP_URL,
+    *,
+    force_new_page: bool = False,
+) -> tuple[CDPClient, subprocess.Popen[Any] | None]:
     chrome_proc: subprocess.Popen[Any] | None = None
     if not chrome_debug_available(args.port):
         profile = Path(args.profile_dir).resolve() if args.profile_dir else default_profile_path()
         chrome_proc = start_chrome(args.port, profile, initial_url, getattr(args, "browser_path", None))
         wait_for_debug_port(args.port, timeout=30)
 
-    page = page_for_wiz(args.port)
+    page = open_fresh_wiz_page(args.port, initial_url) if force_new_page and chrome_proc is None else page_for_wiz(args.port)
     if not page:
         open_tab(args.port, initial_url)
         time.sleep(2)
@@ -141,9 +199,39 @@ def connect_wiz_browser(args: argparse.Namespace, initial_url: str = WIZ_APP_URL
     return cdp, chrome_proc
 
 
+def ensure_same_wiz_account(expected: dict[str, Any], actual: dict[str, Any]) -> None:
+    """Never resume on a Wiz tab that selected a different account."""
+    expected_account = expected.get("account") or {}
+    actual_account = actual.get("account") or {}
+    for key in ("userGuid", "userId"):
+        expected_value = str(expected_account.get(key) or "").strip()
+        actual_value = str(actual_account.get(key) or "").strip()
+        if expected_value and expected_value != actual_value:
+            raise ExportError("为知浏览器恢复后的账号与任务开始时不一致，已停止任务。")
+
+
+def recover_wiz_page(
+    args: argparse.Namespace,
+    previous_cdp: CDPClient,
+    expected_snapshot: dict[str, Any],
+) -> tuple[CDPClient, dict[str, Any], subprocess.Popen[Any] | None]:
+    """Replace a stalled Wiz target with a fresh readonly target for the same account."""
+    previous_cdp.close()
+    cdp, chrome_proc = connect_wiz_browser(args, force_new_page=True)
+    try:
+        snapshot = wait_for_login_state(cdp, timeout=WIZ_PAGE_RECOVERY_LOGIN_TIMEOUT)
+        ensure_same_wiz_account(expected_snapshot, snapshot)
+    except Exception:
+        cdp.close()
+        if chrome_proc and getattr(args, "close_started_chrome", False):
+            chrome_proc.terminate()
+        raise
+    return cdp, snapshot, chrome_proc
+
+
 WIZ_HELPER_JS = r"""
 (() => {
-  if (window.__wandaoWiz && window.__wandaoWiz.version === 2) return true;
+  if (window.__wandaoWiz && window.__wandaoWiz.version === 5) return true;
 
   const reqToPromise = (req) => new Promise((resolve, reject) => {
     req.onsuccess = () => resolve(req.result);
@@ -247,6 +335,14 @@ WIZ_HELPER_JS = r"""
     return result;
   };
 
+  const health = async () => {
+    const account = await currentAccount();
+    const dbName = await userDbName(account);
+    if (!account || !dbName) throw new Error("为知本地会话不可用");
+    await getOne(dbName, "docs", "__wandao_health_probe__");
+    return { userGuid: account.userGuid || "", userId: account.userId || "" };
+  };
+
   const tokenHeaders = async () => {
     const account = await currentAccount();
     if (!account || !account.token) throw new Error("为知登录 token 不可用，请重新登录。");
@@ -260,12 +356,20 @@ WIZ_HELPER_JS = r"""
     const url = `${kbServer}/ks/note/download/${encodeURIComponent(kbGuid)}/${encodeURIComponent(docGuid)}?downloadInfo=1&downloadData=1`;
     const response = await fetch(url, { headers: { "x-wiz-token": account.token }, credentials: "include" });
     const text = await response.text();
+    const meta = {
+      httpStatus: response.status,
+      contentType: response.headers.get("content-type") || "",
+      bodyLength: text.length,
+    };
     let data = null;
     try { data = JSON.parse(text); } catch (_error) {}
     if (!response.ok) {
-      throw new Error(`HTTP ${response.status}: ${text.slice(0, 200)}`);
+      throw new Error(`HTTP ${response.status} (${meta.contentType || "unknown"}, ${meta.bodyLength} bytes)`);
     }
-    return data || { html: text };
+    if (data && typeof data === "object" && !Array.isArray(data)) {
+      return { ...data, __wandaoNoteMeta: meta };
+    }
+    return { html: text, __wandaoNoteMeta: meta };
   };
 
   const otDoc = async (kbGuid, docGuid) => {
@@ -292,24 +396,29 @@ WIZ_HELPER_JS = r"""
     };
   };
 
-  const fetchBase64 = async (url) => {
+  const fetchBase64 = async (url, timeoutMs = 8000) => {
     const headers = await tokenHeaders().catch(() => ({}));
-    let response = null;
-    let firstError = null;
-    try {
-      response = await fetch(url, { headers, credentials: "include" });
-    } catch (error) {
-      firstError = error;
-    }
-    if (!response || !response.ok) {
+    const deadline = Date.now() + Math.max(500, Number(timeoutMs) || 8000);
+    const fetchBody = async (requestHeaders) => {
+      const controller = new AbortController();
+      const remaining = Math.max(1, deadline - Date.now());
+      const timer = window.setTimeout(() => controller.abort(), remaining);
       try {
-        response = await fetch(url, { credentials: "include" });
-      } catch (error) {
-        throw firstError || error;
+        const response = await fetch(url, { headers: requestHeaders, credentials: "include", signal: controller.signal });
+        if (!response.ok) throw new Error(`HTTP ${response.status}: ${url}`);
+        return { response, buffer: await response.arrayBuffer() };
+      } finally {
+        window.clearTimeout(timer);
       }
+    };
+    let result;
+    let firstError = null;
+    try { result = await fetchBody(headers); } catch (error) { firstError = error; }
+    if (!result && Date.now() < deadline) {
+      try { result = await fetchBody({}); } catch (error) { throw firstError || error; }
     }
-    if (!response.ok) throw new Error(`HTTP ${response.status}: ${url}`);
-    const buffer = await response.arrayBuffer();
+    if (!result) throw firstError || new Error(`图片下载超时: ${url}`);
+    const { response, buffer } = result;
     const bytes = new Uint8Array(buffer);
     let binary = "";
     for (let index = 0; index < bytes.length; index += 1) {
@@ -322,37 +431,53 @@ WIZ_HELPER_JS = r"""
     };
   };
 
-  const beginImageLoad = (url) => {
+  const beginImageLoad = (url, timeoutMs = 12000) => {
     const key = `wandao-image-${Date.now()}-${Math.random().toString(36).slice(2)}`;
     window.__wandaoWizImages = window.__wandaoWizImages || {};
     const image = new Image();
     image.decoding = "async";
+    const timer = window.setTimeout(() => {
+      image.src = "";
+      delete window.__wandaoWizImages[key];
+    }, Math.max(500, Number(timeoutMs) || 12000));
     image.src = String(url || "");
-    window.__wandaoWizImages[key] = image;
+    window.__wandaoWizImages[key] = { image, timer };
     return key;
   };
 
+  const cancelImageLoad = (key) => {
+    const state = window.__wandaoWizImages && window.__wandaoWizImages[key];
+    if (!state) return false;
+    window.clearTimeout(state.timer);
+    state.image.src = "";
+    delete window.__wandaoWizImages[key];
+    return true;
+  };
+
   window.__wandaoWiz = {
-    version: 2,
+    version: 5,
     snapshot,
+    health,
     noteDownload,
     otDoc,
     resourceCache,
     fetchBase64,
     beginImageLoad,
+    cancelImageLoad,
   };
   return true;
 })()
 """
 
 
-def install_helpers(cdp: CDPClient) -> None:
-    cdp.evaluate(WIZ_HELPER_JS, timeout=30)
+def install_helpers(cdp: CDPClient, *, timeout: float = 30) -> None:
+    cdp.evaluate(WIZ_HELPER_JS, timeout=timeout)
 
 
-def read_snapshot(cdp: CDPClient) -> dict[str, Any]:
-    install_helpers(cdp)
-    data = cdp.evaluate("window.__wandaoWiz.snapshot()", timeout=60)
+def read_snapshot(cdp: CDPClient, *, timeout: float = 60) -> dict[str, Any]:
+    deadline = time.time() + timeout
+    install_helpers(cdp, timeout=timeout)
+    data = cdp.evaluate("window.__wandaoWiz.snapshot()", timeout=max(0.5, deadline - time.time()))
     if not isinstance(data, dict):
         raise ExportError("读取为知笔记登录状态失败：页面没有返回有效数据。")
     account = data.get("account") or {}
@@ -366,10 +491,11 @@ def wait_for_login_state(cdp: CDPClient, timeout: int = 20) -> dict[str, Any]:
     last_error = ""
     while time.time() < deadline:
         try:
-            return read_snapshot(cdp)
+            remaining = max(0.5, deadline - time.time())
+            return read_snapshot(cdp, timeout=min(60.0, remaining))
         except Exception as exc:  # noqa: BLE001 - keep polling after login redirect.
             last_error = str(exc)
-            time.sleep(1)
+            time.sleep(min(1.0, max(0.0, deadline - time.time())))
     raise ExportError(last_error or "未检测到为知笔记登录态。")
 
 
@@ -568,7 +694,16 @@ def extension_from_name(name: str, content_type: str = "") -> str:
 
 
 class ResourceSaver:
-    def __init__(self, cdp: CDPClient, doc: WizDoc, md_path: Path, kb_server: str, args: argparse.Namespace) -> None:
+    def __init__(
+        self,
+        cdp: CDPClient,
+        doc: WizDoc,
+        md_path: Path,
+        kb_server: str,
+        args: argparse.Namespace,
+        checkpoint: Any | None = None,
+        item_key: str = "",
+    ) -> None:
         self.cdp = cdp
         self.doc = doc
         self.md_path = md_path
@@ -578,6 +713,57 @@ class ResourceSaver:
         self.saved: dict[str, str] = {}
         self.image_count = 0
         self.failures: list[dict[str, str]] = []
+        self.checkpoint = checkpoint
+        self.item_key = item_key
+        failed_hosts = getattr(args, "_wiz_unavailable_external_image_hosts", None)
+        if not isinstance(failed_hosts, set):
+            failed_hosts = set()
+            setattr(args, "_wiz_unavailable_external_image_hosts", failed_hosts)
+        self.unavailable_external_image_hosts: set[str] = failed_hosts
+
+    def start_image_resource(self, url: str) -> str:
+        resource_key = wiz_resource_key(self.doc, "image", url)
+        if self.checkpoint and resource_key:
+            self.checkpoint.upsert_resource(
+                self.item_key,
+                resource_key,
+                "image",
+                safe_resource_url(url),
+            )
+            self.checkpoint.start_resource(resource_key)
+        return resource_key
+
+    def complete_image_resource(self, resource_key: str, relative_path: str) -> None:
+        if self.checkpoint and resource_key and relative_path:
+            self.checkpoint.complete_resource(
+                resource_key,
+                local_path=str((self.md_path.parent / relative_path).resolve()),
+                target=relative_path,
+            )
+
+    def fail_image_resource(self, resource_key: str, error: Exception | str) -> None:
+        if self.checkpoint and resource_key:
+            self.checkpoint.fail_resource(resource_key, str(error))
+
+    def image_deadline(self) -> float:
+        check_stopped(self.args)
+        return time.time() + WIZ_IMAGE_TOTAL_TIMEOUT
+
+    def remaining_image_timeout(self, deadline: float) -> float:
+        check_stopped(self.args)
+        remaining = deadline - time.time()
+        if remaining <= 0:
+            raise ExportError("图片下载超时")
+        return max(0.5, remaining)
+
+    def is_wiz_resource_url(self, url: str) -> bool:
+        target = urllib.parse.urlsplit(url)
+        trusted = urllib.parse.urlsplit(self.kb_server)
+        return bool(target.netloc) and target.scheme in {"http", "https"} and target.netloc.lower() == trusted.netloc.lower()
+
+    @staticmethod
+    def external_host(url: str) -> str:
+        return str(urllib.parse.urlsplit(url).netloc or "").lower()
 
     def build_collab_url(self, src: str) -> str:
         if re.match(r"^https?://", src, re.I):
@@ -602,79 +788,103 @@ class ResourceSaver:
         quoted = urllib.parse.quote(value, safe="/")
         return f"{self.kb_server}/ks/note/view/{self.doc.kb_guid}/{self.doc.doc_guid}/index_files/{quoted}"
 
-    def fetch_base64(self, url: str) -> dict[str, Any]:
+    def fetch_base64(self, url: str, *, timeout: float) -> dict[str, Any]:
         throttle_request(self.args)
-        expression = f"window.__wandaoWiz.fetchBase64({js_string(url)})"
-        return self.cdp.evaluate(expression, timeout=120)
+        check_stopped(self.args)
+        timeout = max(0.5, float(timeout))
+        expression = f"window.__wandaoWiz.fetchBase64({js_string(url)}, {int(timeout * 1000)})"
+        return self.cdp.evaluate(expression, timeout=timeout + 1)
 
-    def fetch_base64_via_browser(self, url: str) -> dict[str, Any]:
+    def fetch_base64_via_browser(self, url: str, *, deadline: float | None = None) -> dict[str, Any]:
         """Load an image as the logged-in browser and read its CDP response body."""
-        self.cdp.send("Network.enable", {}, timeout=10)
-        self.cdp.send("Network.setCacheDisabled", {"cacheDisabled": True}, timeout=10)
-        self.cdp.evaluate(f"window.__wandaoWiz.beginImageLoad({js_string(url)})", timeout=10)
-        response_event = self.cdp.wait_for_event(
-            "Network.responseReceived",
-            timeout=30,
-            predicate=lambda event: (
-                str(event.get("params", {}).get("response", {}).get("url") or "") == url
-                and str(event.get("params", {}).get("type") or "").lower() in {"image", "media"}
-            ),
-        )
-        params = response_event.get("params") or {}
-        request_id = str(params.get("requestId") or "")
-        response = params.get("response") or {}
-        status = int(response.get("status") or 0)
-        while 300 <= status < 400:
+        deadline = deadline if deadline is not None else self.image_deadline()
+        image_token = ""
+        try:
+            self.cdp.send("Network.enable", {}, timeout=self.remaining_image_timeout(deadline))
+            self.cdp.send("Network.setCacheDisabled", {"cacheDisabled": True}, timeout=self.remaining_image_timeout(deadline))
+            image_token = str(
+                self.cdp.evaluate(
+                    f"window.__wandaoWiz.beginImageLoad({js_string(url)}, {int(self.remaining_image_timeout(deadline) * 1000)})",
+                    timeout=self.remaining_image_timeout(deadline),
+                )
+                or ""
+            )
             response_event = self.cdp.wait_for_event(
                 "Network.responseReceived",
-                timeout=30,
-                predicate=lambda event: str(event.get("params", {}).get("requestId") or "") == request_id,
+                timeout=self.remaining_image_timeout(deadline),
+                predicate=lambda event: (
+                    str(event.get("params", {}).get("response", {}).get("url") or "") == url
+                    and str(event.get("params", {}).get("type") or "").lower() in {"image", "media"}
+                ),
             )
-            response = (response_event.get("params") or {}).get("response") or {}
+            params = response_event.get("params") or {}
+            request_id = str(params.get("requestId") or "")
+            response = params.get("response") or {}
             status = int(response.get("status") or 0)
-        headers = response.get("headers") or {}
-        content_type = str(response.get("mimeType") or next((value for key, value in headers.items() if str(key).lower() == "content-type"), ""))
-        if status < 200 or status >= 300:
-            raise ExportError(f"图片响应 HTTP {status}")
-        if not content_type.lower().startswith("image/"):
-            raise ExportError("浏览器响应不是图片")
-        try:
-            failed = self.cdp.wait_for_event(
-                "Network.loadingFailed",
-                timeout=0.1,
-                predicate=lambda event: str(event.get("params", {}).get("requestId") or "") == request_id,
-            )
-        except Exception:
-            failed = None
-        if failed:
-            error_text = str((failed.get("params") or {}).get("errorText") or "图片加载失败")
-            raise ExportError(error_text)
-        try:
-            self.cdp.wait_for_event(
-                "Network.loadingFinished",
-                timeout=30,
-                predicate=lambda event: str(event.get("params", {}).get("requestId") or "") == request_id,
-            )
-        except Exception:
-            for event in getattr(self.cdp, "pending_events", []):
-                event_params = event.get("params") or {}
-                if event.get("method") == "Network.loadingFailed" and str(event_params.get("requestId") or "") == request_id:
-                    raise ExportError(str(event_params.get("errorText") or "图片加载失败"))
-            raise
-        body = self.cdp.send("Network.getResponseBody", {"requestId": request_id}, timeout=30).get("result") or {}
-        raw = str(body.get("body") or "")
-        if not raw:
-            raise ExportError("浏览器没有返回图片响应体")
-        if not body.get("base64Encoded"):
-            raw = base64.b64encode(raw.encode("latin-1")).decode("ascii")
-        return {"base64": raw, "contentType": content_type, "finalUrl": str(response.get("url") or url)}
+            while 300 <= status < 400:
+                response_event = self.cdp.wait_for_event(
+                    "Network.responseReceived",
+                    timeout=self.remaining_image_timeout(deadline),
+                    predicate=lambda event: str(event.get("params", {}).get("requestId") or "") == request_id,
+                )
+                response = (response_event.get("params") or {}).get("response") or {}
+                status = int(response.get("status") or 0)
+            headers = response.get("headers") or {}
+            content_type = str(response.get("mimeType") or next((value for key, value in headers.items() if str(key).lower() == "content-type"), ""))
+            if status < 200 or status >= 300:
+                raise ExportError(f"图片响应 HTTP {status}")
+            if not content_type.lower().startswith("image/"):
+                raise ExportError("浏览器响应不是图片")
+            try:
+                failed = self.cdp.wait_for_event(
+                    "Network.loadingFailed",
+                    timeout=0.1,
+                    predicate=lambda event: str(event.get("params", {}).get("requestId") or "") == request_id,
+                )
+            except Exception:
+                failed = None
+            if failed:
+                error_text = str((failed.get("params") or {}).get("errorText") or "图片加载失败")
+                raise ExportError(error_text)
+            try:
+                self.cdp.wait_for_event(
+                    "Network.loadingFinished",
+                    timeout=self.remaining_image_timeout(deadline),
+                    predicate=lambda event: str(event.get("params", {}).get("requestId") or "") == request_id,
+                )
+            except Exception:
+                for event in getattr(self.cdp, "pending_events", []):
+                    event_params = event.get("params") or {}
+                    if event.get("method") == "Network.loadingFailed" and str(event_params.get("requestId") or "") == request_id:
+                        raise ExportError(str(event_params.get("errorText") or "图片加载失败"))
+                raise
+            body = self.cdp.send(
+                "Network.getResponseBody",
+                {"requestId": request_id},
+                timeout=self.remaining_image_timeout(deadline),
+            ).get("result") or {}
+            raw = str(body.get("body") or "")
+            if not raw:
+                raise ExportError("浏览器没有返回图片响应体")
+            if not body.get("base64Encoded"):
+                raw = base64.b64encode(raw.encode("latin-1")).decode("ascii")
+            return {"base64": raw, "contentType": content_type, "finalUrl": str(response.get("url") or url)}
+        finally:
+            if image_token:
+                try:
+                    self.cdp.evaluate(f"window.__wandaoWiz.cancelImageLoad({js_string(image_token)})", timeout=1)
+                except Exception:
+                    pass
 
-    def fetch_cache_base64(self, name: str) -> dict[str, Any] | None:
+    def fetch_cache_base64(self, name: str, *, deadline: float | None = None) -> dict[str, Any] | None:
+        deadline = deadline if deadline is not None else self.image_deadline()
         expression = f"window.__wandaoWiz.resourceCache({js_string(name)})"
-        return self.cdp.evaluate(expression, timeout=60)
+        return self.cdp.evaluate(expression, timeout=self.remaining_image_timeout(deadline))
 
-    def fetch_external_base64(self, url: str) -> dict[str, Any]:
-        """Read a public external image when its host rejects the browser fallback."""
+    def fetch_external_base64(self, url: str, *, timeout: float = WIZ_EXTERNAL_IMAGE_TIMEOUT) -> dict[str, Any]:
+        """Read a public image without Wiz credentials or browser cookies."""
+        throttle_request(self.args)
+        check_stopped(self.args)
         request = urllib.request.Request(
             url,
             headers={
@@ -682,13 +892,14 @@ class ResourceSaver:
                 "Referer": self.kb_server + "/",
             },
         )
-        with urllib.request.urlopen(request, timeout=30) as response:
+        with urllib.request.urlopen(request, timeout=max(0.5, timeout)) as response:
             status = int(getattr(response, "status", 200) or 200)
             if status < 200 or status >= 300:
                 raise ExportError(f"图片响应 HTTP {status}")
             headers = getattr(response, "headers", {})
             content_type = str(headers.get("Content-Type") or headers.get("content-type") or "")
             body = response.read()
+        check_stopped(self.args)
         if not body:
             raise ExportError("HTTP 图片响应体为空")
         return {
@@ -696,6 +907,50 @@ class ResourceSaver:
             "contentType": content_type,
             "finalUrl": url,
         }
+
+    def fetch_trusted_image(self, url: str, *, cache_name: str = "") -> dict[str, Any]:
+        deadline = self.image_deadline()
+        try:
+            return self.fetch_base64(url, timeout=min(WIZ_IMAGE_PRIMARY_TIMEOUT, self.remaining_image_timeout(deadline)))
+        except (ExportStopped, WizPageSessionLost):
+            raise
+        except Exception as primary_error:
+            raise_if_wiz_page_session_lost(self.cdp, "图片下载", primary_error)
+        try:
+            return self.fetch_base64_via_browser(url, deadline=deadline)
+        except (ExportStopped, WizPageSessionLost):
+            raise
+        except Exception as browser_error:
+            raise_if_wiz_page_session_lost(self.cdp, "图片浏览器兜底", browser_error)
+            if cache_name:
+                try:
+                    cached = self.fetch_cache_base64(cache_name, deadline=deadline)
+                    if cached:
+                        return cached
+                except (ExportStopped, WizPageSessionLost):
+                    raise
+                except Exception as cache_error:
+                    raise_if_wiz_page_session_lost(self.cdp, "图片本地缓存", cache_error)
+            raise ExportError(str(browser_error or primary_error)) from browser_error
+
+    def save_external_image(self, key: str, url: str, name: str, alt: str = "") -> str:
+        host = self.external_host(url)
+        if not host or host in self.unavailable_external_image_hosts:
+            return url
+        resource_key = self.start_image_resource(url)
+        try:
+            payload = self.fetch_external_base64(url)
+            relative_path = self.save_data(key, name, payload, alt)
+            self.complete_image_resource(resource_key, relative_path)
+            return relative_path
+        except ExportStopped:
+            self.fail_image_resource(resource_key, "stopped")
+            raise
+        except Exception as exc:
+            self.fail_image_resource(resource_key, exc)
+            self.unavailable_external_image_hosts.add(host)
+            self.failures.append({"url": url, "error": f"外部图片主机不可用：{exc}"})
+            return url
 
     def save_data(self, key: str, name: str, payload: dict[str, Any], alt: str = "") -> str:
         if key in self.saved:
@@ -720,23 +975,23 @@ class ResourceSaver:
         if key in self.saved:
             return self.saved[key]
         url = self.build_collab_url(src)
+        if not self.is_wiz_resource_url(url):
+            return self.save_external_image(key, url, file_name or src, alt)
+        resource_key = self.start_image_resource(url)
         try:
-            payload = self.fetch_base64(url)
-        except Exception as browser_exc:
-            try:
-                payload = self.fetch_base64_via_browser(url)
-            except Exception as browser_exc:
-                try:
-                    payload = self.fetch_cache_base64(src)
-                except Exception:
-                    payload = None
-                if not payload:
-                    self.failures.append({"url": url, "error": f"浏览器兜底失败：{browser_exc}"})
-                    return ""
-        if not payload:
-            self.failures.append({"url": url, "error": "图片下载失败"})
-            return ""
-        return self.save_data(key, file_name or src, payload, alt)
+            payload = self.fetch_trusted_image(url, cache_name=src)
+        except ExportStopped:
+            raise
+        except WizPageSessionLost:
+            self.fail_image_resource(resource_key, "Wiz page session lost")
+            raise
+        except Exception as exc:
+            self.fail_image_resource(resource_key, exc)
+            self.failures.append({"url": url, "error": str(exc)})
+            return url
+        relative_path = self.save_data(key, file_name or src, payload, alt)
+        self.complete_image_resource(resource_key, relative_path)
+        return relative_path
 
     def save_normal_image(self, src: str, alt: str = "") -> str:
         key = f"normal:{src}"
@@ -749,24 +1004,21 @@ class ResourceSaver:
             payload = {"contentType": match.group(1), "base64": match.group(2)}
             return self.save_data(key, alt or f"image{self.image_count + 1:03d}", payload, alt)
         url = self.build_normal_url(src)
+        if not self.is_wiz_resource_url(url):
+            return self.save_external_image(key, url, Path(PurePosixPath(urllib.parse.urlparse(url).path).name).name or src, alt)
+        resource_key = self.start_image_resource(url)
         try:
-            payload = self.fetch_base64(url)
-            return self.save_data(key, Path(PurePosixPath(urllib.parse.urlparse(url).path).name).name or src, payload, alt)
+            payload = self.fetch_trusted_image(url)
+            relative_path = self.save_data(key, Path(PurePosixPath(urllib.parse.urlparse(url).path).name).name or src, payload, alt)
+            self.complete_image_resource(resource_key, relative_path)
+            return relative_path
+        except (ExportStopped, WizPageSessionLost):
+            self.fail_image_resource(resource_key, "stopped")
+            raise
         except Exception as exc:  # noqa: BLE001 - keep exporting the note body.
-            try:
-                payload = self.fetch_base64_via_browser(url)
-                return self.save_data(key, Path(PurePosixPath(urllib.parse.urlparse(url).path).name).name or src, payload, alt)
-            except Exception as browser_exc:
-                parsed = urllib.parse.urlparse(url)
-                wiz_host = urllib.parse.urlparse(self.kb_server).netloc.lower()
-                if parsed.scheme in {"http", "https"} and parsed.netloc.lower() != wiz_host:
-                    try:
-                        payload = self.fetch_external_base64(url)
-                        return self.save_data(key, Path(PurePosixPath(parsed.path).name).name or src, payload, alt)
-                    except Exception:
-                        pass
-                self.failures.append({"url": url, "error": str(browser_exc or exc)})
-                return ""
+            self.fail_image_resource(resource_key, exc)
+            self.failures.append({"url": url, "error": str(exc)})
+            return url
 
 
 def blocks_to_markdown(doc: WizDoc, blocks: list[dict[str, Any]], saver: ResourceSaver) -> str:
@@ -986,54 +1238,175 @@ def get_kb_server(snapshot: dict[str, Any], doc: WizDoc) -> str:
     return str(account.get("kbServer") or "")
 
 
-def fetch_ot_document(cdp: CDPClient, doc: WizDoc) -> dict[str, Any] | None:
-    install_helpers(cdp)
+def is_timeout_error(error: BaseException) -> bool:
+    message = str(error).lower()
+    return "timeout" in message or "timed out" in message or "超时" in message
+
+
+def check_wiz_page_health(cdp: CDPClient) -> None:
+    """Verify that a lightweight readonly IndexedDB call still completes."""
+    deadline = time.time() + WIZ_PAGE_HEALTH_TIMEOUT
+    install_helpers(cdp, timeout=WIZ_PAGE_HEALTH_TIMEOUT)
+    result = cdp.evaluate("window.__wandaoWiz.health()", timeout=max(0.5, deadline - time.time()))
+    if not isinstance(result, dict) or not (result.get("userGuid") or result.get("userId")):
+        raise ExportError("为知网页健康检查未返回当前账号。")
+
+
+def raise_if_wiz_page_session_lost(cdp: CDPClient, source: str, error: BaseException) -> None:
+    if not is_timeout_error(error):
+        return
+    try:
+        check_wiz_page_health(cdp)
+    except Exception as health_error:
+        raise WizPageSessionLost(
+            f"为知网页会话无响应：{source} 超时后只读健康检查也失败：{health_error}"
+        ) from error
+
+
+def note_download_diagnostics(data: Any) -> str:
+    if not isinstance(data, dict):
+        return "无响应元数据"
+    metadata = data.get("__wandaoNoteMeta")
+    if not isinstance(metadata, dict):
+        return "无响应元数据"
+    status = metadata.get("httpStatus")
+    content_type = str(metadata.get("contentType") or "unknown")
+    body_length = metadata.get("bodyLength")
+    return f"HTTP {status if status is not None else 'unknown'}, {content_type}, bodyLength={body_length if body_length is not None else 'unknown'}"
+
+
+def document_metadata_hint(doc: WizDoc) -> str:
+    raw = doc.raw or {}
+    file_type = str(doc.file_type or raw.get("fileType") or "unknown")
+    try:
+        data_size = int(raw.get("dataSize") or 0)
+    except (TypeError, ValueError):
+        data_size = 0
+    try:
+        attachment_count = int(raw.get("attachmentCount") or 0)
+    except (TypeError, ValueError):
+        attachment_count = 0
+    return f"fileType={file_type}, dataSize={data_size}, attachmentCount={attachment_count}"
+
+
+def is_file_note(doc: WizDoc) -> bool:
+    file_type = str(doc.file_type or doc.raw.get("fileType") or "").lower()
+    title = str(doc.title or "").lower()
+    return "pdf" in file_type or title.endswith(".pdf")
+
+
+def fetch_ot_document(
+    cdp: CDPClient,
+    doc: WizDoc,
+    *,
+    timeout: float = WIZ_OT_DOCUMENT_TIMEOUT,
+) -> dict[str, Any] | None:
+    deadline = time.time() + timeout
+    install_helpers(cdp, timeout=timeout)
     expression = f"window.__wandaoWiz.otDoc({js_string(doc.kb_guid)}, {js_string(doc.doc_guid)})"
-    data = cdp.evaluate(expression, timeout=60)
+    data = cdp.evaluate(expression, timeout=max(0.5, deadline - time.time()))
     if not data or not data.get("text"):
         return None
     return json.loads(data["text"])
 
 
-def fetch_note_download(cdp: CDPClient, doc: WizDoc) -> dict[str, Any] | None:
-    install_helpers(cdp)
+def fetch_note_download(
+    cdp: CDPClient,
+    doc: WizDoc,
+    *,
+    timeout: float = WIZ_NOTE_DOWNLOAD_TIMEOUT,
+) -> dict[str, Any] | None:
+    deadline = time.time() + timeout
+    install_helpers(cdp, timeout=timeout)
     expression = f"window.__wandaoWiz.noteDownload({js_string(doc.kb_guid)}, {js_string(doc.doc_guid)})"
-    data = cdp.evaluate(expression, timeout=90)
+    data = cdp.evaluate(expression, timeout=max(0.5, deadline - time.time()))
     if not isinstance(data, dict) or int(data.get("returnCode") or data.get("return_code") or 200) != 200:
         return None
     return data
 
 
-def export_doc(cdp: CDPClient, snapshot: dict[str, Any], doc: WizDoc, md_path: Path, args: argparse.Namespace) -> tuple[int, list[dict[str, str]]]:
+def export_doc(
+    cdp: CDPClient,
+    snapshot: dict[str, Any],
+    doc: WizDoc,
+    md_path: Path,
+    args: argparse.Namespace,
+    checkpoint: Any | None = None,
+    item_key: str = "",
+) -> tuple[int, list[dict[str, str]]]:
     kb_server = get_kb_server(snapshot, doc)
     if not kb_server:
         raise ExportError(f"笔记 {doc.title} 缺少 kbServer，无法下载正文资源。")
-    saver = ResourceSaver(cdp, doc, md_path, kb_server, args)
+    saver = ResourceSaver(cdp, doc, md_path, kb_server, args, checkpoint, item_key)
     markdown = ""
+    html_text = ""
+    source_errors: list[str] = []
+    note_attempt_errors: list[str] = []
+    ot_attempted = False
+
+    def try_ot_document() -> None:
+        nonlocal markdown, ot_attempted
+        if ot_attempted:
+            return
+        ot_attempted = True
+        try:
+            ot_data = fetch_ot_document(cdp, doc)
+        except (ExportStopped, WizPageSessionLost):
+            raise
+        except Exception as exc:
+            source_errors.append(f"otDoc: {exc}")
+            raise_if_wiz_page_session_lost(cdp, "otDoc", exc)
+            return
+        if ot_data and isinstance(ot_data.get("blocks"), list):
+            markdown = blocks_to_markdown(doc, ot_data.get("blocks") or [], saver)
+        else:
+            source_errors.append("otDoc: 未返回本地正文数据")
+
+    def try_note_download(*, timeout: float = WIZ_NOTE_DOWNLOAD_TIMEOUT) -> str:
+        nonlocal markdown, html_text
+        try:
+            downloaded = fetch_note_download(cdp, doc, timeout=timeout)
+        except (ExportStopped, WizPageSessionLost):
+            raise
+        except Exception as exc:
+            note_attempt_errors.append(f"noteDownload: {exc}")
+            raise_if_wiz_page_session_lost(cdp, "noteDownload", exc)
+            return "error"
+        html_text = str((downloaded or {}).get("html") or "")
+        if not html_text:
+            note_attempt_errors.append(f"noteDownload: 未返回可用正文（{note_download_diagnostics(downloaded)}）")
+            return "empty"
+        parser = WizHtmlToMarkdown(saver.save_normal_image)
+        parser.feed(html_text)
+        markdown = parser.result()
+        if not markdown:
+            note_attempt_errors.append(f"noteDownload: 正文解析后为空（{note_download_diagnostics(downloaded)}）")
+            return "empty"
+        return "success"
 
     if doc.note_type == "collaboration":
-        ot_data = fetch_ot_document(cdp, doc)
-        if ot_data and isinstance(ot_data.get("blocks"), list):
-            markdown = blocks_to_markdown(doc, ot_data.get("blocks") or [], saver)
+        try_ot_document()
 
     if not markdown:
-        downloaded = fetch_note_download(cdp, doc)
-        html_text = str((downloaded or {}).get("html") or "")
-        if html_text:
-            parser = WizHtmlToMarkdown(saver.save_normal_image)
-            parser.feed(html_text)
-            markdown = parser.result()
+        note_status = try_note_download()
+        if note_status == "empty" and not is_file_note(doc) and not is_explicitly_empty_note_html(html_text):
+            check_stopped(args)
+            time.sleep(WIZ_EMPTY_BODY_RETRY_DELAY)
+            note_status = try_note_download(timeout=WIZ_EMPTY_BODY_RETRY_TIMEOUT)
+        if note_status != "success":
+            source_errors.extend(note_attempt_errors)
 
-    if not markdown:
-        ot_data = fetch_ot_document(cdp, doc)
-        if ot_data and isinstance(ot_data.get("blocks"), list):
-            markdown = blocks_to_markdown(doc, ot_data.get("blocks") or [], saver)
+    if not markdown and not ot_attempted:
+        try_ot_document()
 
     if not markdown and is_explicitly_empty_note_html(html_text):
         markdown = f"# {doc.title}\n"
 
     if not markdown:
-        raise ExportError("未能读取正文，可能是笔记尚未同步或登录态已失效。")
+        if is_file_note(doc):
+            source_errors.append(f"文件型笔记元数据：{document_metadata_hint(doc)}")
+        details = "；".join(source_errors) or "没有可用的正文来源"
+        raise ExportError(f"正文读取失败：{details}。")
 
     if not re.match(r"^#\s+", markdown.lstrip()):
         markdown = f"# {doc.title}\n\n{markdown.strip()}\n"
@@ -1088,6 +1461,52 @@ def should_skip_existing_doc(*, incremental: bool, path_exists: bool, retry_fail
     return bool(incremental and path_exists and not retry_failed)
 
 
+def export_doc_with_page_recovery(
+    args: argparse.Namespace,
+    cdp: CDPClient,
+    snapshot: dict[str, Any],
+    doc: WizDoc,
+    md_path: Path,
+    started_chrome: list[subprocess.Popen[Any]],
+    checkpoint: Any | None = None,
+    item_key: str = "",
+) -> tuple[CDPClient, dict[str, Any], int, list[dict[str, str]]]:
+    """Retry one document once after replacing an unresponsive Wiz target."""
+    for recovery_attempt in range(2):
+        try:
+            count, image_failures = export_doc(cdp, snapshot, doc, md_path, args, checkpoint, item_key)
+            return cdp, snapshot, count, image_failures
+        except WizPageSessionLost as exc:
+            if recovery_attempt:
+                raise WizPageSessionUnrecoverable(
+                    f"为知网页会话恢复后仍无响应，当前笔记“{doc.title}”未完成。"
+                    "为保留其余笔记的断点状态，导出已停止。"
+                ) from exc
+            emit(
+                args,
+                f"为知网页会话无响应，正在新建只读标签页后重试当前笔记：{doc.title}",
+                event="browser.page.recovery",
+                level="warn",
+            )
+            try:
+                cdp, snapshot, chrome_proc = recover_wiz_page(args, cdp, snapshot)
+            except ExportStopped:
+                raise
+            except Exception as recovery_error:
+                raise WizPageSessionUnrecoverable(
+                    f"为知网页会话无响应，无法恢复当前笔记“{doc.title}”：{recovery_error}"
+                ) from recovery_error
+            if chrome_proc:
+                started_chrome.append(chrome_proc)
+            emit(
+                args,
+                f"为知网页会话已恢复，正在重试当前笔记：{doc.title}",
+                event="browser.page.recovered",
+                level="warn",
+            )
+    raise AssertionError("unreachable")
+
+
 def export_wiz(args: argparse.Namespace) -> dict[str, Any]:
     started = time.time()
     output = Path(args.output).resolve()
@@ -1095,6 +1514,7 @@ def export_wiz(args: argparse.Namespace) -> dict[str, Any]:
     checkpoint = open_checkpoint_from_args(args, "wiz", "export")
 
     cdp, chrome_proc = connect_wiz_browser(args)
+    started_chrome = [chrome_proc] if chrome_proc else []
     try:
         snapshot = wait_for_login_state(cdp, timeout=30)
         docs = docs_from_snapshot(snapshot)
@@ -1122,7 +1542,23 @@ def export_wiz(args: argparse.Namespace) -> dict[str, Any]:
                     metadata={"docGuid": doc.doc_guid, "kbGuid": doc.kb_guid, "category": doc.category},
                 )
             if getattr(args, "retry_failed", False):
-                docs = [doc for doc in docs if checkpoint.item_status(f"wiz:doc:{doc.doc_guid}") == "failed"]
+                retry_docs: list[WizDoc] = []
+                for doc in docs:
+                    item_key = f"wiz:doc:{doc.doc_guid}"
+                    if checkpoint.item_status(item_key) != "failed":
+                        continue
+                    md_path = doc_paths[doc.doc_guid]
+                    if md_path.is_file():
+                        # Earlier Wiz releases marked a fully written document as
+                        # failed when only a remote image was unavailable.
+                        checkpoint.complete_item(
+                            item_key,
+                            local_path=str(md_path),
+                            metadata={"docGuid": doc.doc_guid, "recoveredExistingMarkdown": True},
+                        )
+                        continue
+                    retry_docs.append(doc)
+                docs = retry_docs
 
         exported = 0
         skipped = 0
@@ -1162,7 +1598,16 @@ def export_wiz(args: argparse.Namespace) -> dict[str, Any]:
                         event="document.export.started",
                         doc={"id": doc.doc_guid, "title": doc.title, "index": index, "path": str(md_path)},
                     )
-                    count, img_failures = export_doc(cdp, snapshot, doc, md_path, args)
+                    cdp, snapshot, count, img_failures = export_doc_with_page_recovery(
+                        args,
+                        cdp,
+                        snapshot,
+                        doc,
+                        md_path,
+                        started_chrome,
+                        checkpoint,
+                        item_key,
+                    )
                     image_success += count
                     image_failures.extend({"docGuid": doc.doc_guid, "title": doc.title, **item} for item in img_failures)
                     for failure in img_failures:
@@ -1177,10 +1622,11 @@ def export_wiz(args: argparse.Namespace) -> dict[str, Any]:
                         )
                     exported += 1
                     if checkpoint:
-                        if img_failures:
-                            checkpoint.fail_item(item_key, f"{len(img_failures)} 个图片下载失败")
-                        else:
-                            checkpoint.complete_item(item_key, local_path=str(md_path), metadata={"docGuid": doc.doc_guid})
+                        checkpoint.complete_item(
+                            item_key,
+                            local_path=str(md_path),
+                            metadata={"docGuid": doc.doc_guid, "imageFailureCount": len(img_failures)},
+                        )
                     emit(
                         args,
                         f"为知笔记导出完成：{doc.title}",
@@ -1191,6 +1637,20 @@ def export_wiz(args: argparse.Namespace) -> dict[str, Any]:
             except ExportStopped:
                 if checkpoint:
                     checkpoint.fail_item(item_key, "stopped")
+                raise
+            except WizPageSessionUnrecoverable as exc:
+                if checkpoint:
+                    checkpoint.fail_item(item_key, str(exc))
+                    checkpoint.fail_task(str(exc), status="failed")
+                failures.append({"docGuid": doc.doc_guid, "title": doc.title, "error": str(exc)})
+                emit(
+                    args,
+                    f"为知笔记导出失败：{doc.title}：{exc}",
+                    event="document.export.failed",
+                    level="error",
+                    doc={"id": doc.doc_guid, "title": doc.title, "index": index, "path": str(md_path)},
+                    error={"type": type(exc).__name__, "message": str(exc)},
+                )
                 raise
             except Exception as exc:  # noqa: BLE001 - keep exporting other docs.
                 if checkpoint:
@@ -1237,7 +1697,7 @@ def export_wiz(args: argparse.Namespace) -> dict[str, Any]:
         report = finalize_report(report, provider="wiz", mode="export", report_file=report_path, output=output)
         report_path.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
         if checkpoint:
-            if failures or image_failures:
+            if failures:
                 checkpoint.fail_task(
                     f"{len(failures)} 个文档失败，{len(image_failures)} 个图片失败",
                     status="failed",
@@ -1261,8 +1721,9 @@ def export_wiz(args: argparse.Namespace) -> dict[str, Any]:
         return report
     finally:
         cdp.close()
-        if chrome_proc and args.close_started_chrome:
-            chrome_proc.terminate()
+        if args.close_started_chrome:
+            for proc in started_chrome:
+                proc.terminate()
         if checkpoint:
             checkpoint.close()
 

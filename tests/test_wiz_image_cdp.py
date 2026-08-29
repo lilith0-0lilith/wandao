@@ -1,9 +1,9 @@
 import base64
 import unittest
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
-from plugins.wiz.backend.export_wiz import ResourceSaver, WizDoc, WIZ_HELPER_JS
+from plugins.wiz.backend.export_wiz import ResourceSaver, WizDoc, WizPageSessionLost, WIZ_HELPER_JS
 
 
 class FakeCdp:
@@ -39,10 +39,11 @@ def make_saver(cdp):
 
 
 class WizImageCdpTests(unittest.TestCase):
-    def test_external_image_uses_http_fallback_after_browser_rejection(self):
+    def test_external_image_downloads_without_browser_credentials(self):
         saver = make_saver(FakeCdp([]))
-        saver.fetch_base64 = lambda _url: (_ for _ in ()).throw(RuntimeError("cors"))
-        saver.fetch_base64_via_browser = lambda _url: (_ for _ in ()).throw(RuntimeError("HTTP 405"))
+        saver.fetch_base64 = Mock(side_effect=AssertionError("external image must not use Wiz credentials"))
+        saver.fetch_base64_via_browser = Mock(side_effect=AssertionError("external image must not use the browser"))
+        saver.save_data = Mock(return_value="test_assets/image.png")
 
         class Response:
             headers = {"Content-Type": "image/png"}
@@ -58,12 +59,31 @@ class WizImageCdpTests(unittest.TestCase):
 
         with patch("plugins.wiz.backend.export_wiz.urllib.request.urlopen", return_value=Response()) as opened:
             result = saver.save_normal_image("https://images.example.invalid/image.png", "image")
-        self.assertTrue(result)
+        self.assertEqual(result, "test_assets/image.png")
         opened.assert_called_once()
+        request = opened.call_args.args[0]
+        self.assertIsNone(request.get_header("x-wiz-token"))
+        self.assertIsNone(request.get_header("Cookie"))
+        saver.fetch_base64.assert_not_called()
+        saver.fetch_base64_via_browser.assert_not_called()
+
+    def test_failed_external_host_is_not_retried_for_later_images(self):
+        saver = make_saver(FakeCdp([]))
+        saver.fetch_external_base64 = Mock(side_effect=TimeoutError("timed out"))
+        first_url = "https://images.example.invalid/first.png"
+        second_url = "https://images.example.invalid/second.png"
+
+        self.assertEqual(saver.save_normal_image(first_url), first_url)
+        self.assertEqual(saver.save_normal_image(second_url), second_url)
+
+        saver.fetch_external_base64.assert_called_once_with(first_url)
+        self.assertEqual(len(saver.failures), 1)
 
     def test_browser_helper_version_is_bumped_for_new_image_loader(self):
-        self.assertIn("version === 2", WIZ_HELPER_JS)
-        self.assertIn("version: 2", WIZ_HELPER_JS)
+        self.assertIn("version === 5", WIZ_HELPER_JS)
+        self.assertIn("version: 5", WIZ_HELPER_JS)
+        self.assertIn("AbortController", WIZ_HELPER_JS)
+        self.assertIn("cancelImageLoad", WIZ_HELPER_JS)
 
     def test_browser_fallback_reads_body_only_after_loading_finished(self):
         request_id = "request-1"
@@ -93,11 +113,24 @@ class WizImageCdpTests(unittest.TestCase):
 
     def test_collab_failure_keeps_browser_fallback_stage(self):
         saver = make_saver(FakeCdp([]))
-        saver.fetch_base64 = lambda _url: (_ for _ in ()).throw(RuntimeError("cors"))
-        saver.fetch_base64_via_browser = lambda _url: (_ for _ in ()).throw(RuntimeError("response timeout"))
-        saver.fetch_cache_base64 = lambda _name: None
-        self.assertEqual(saver.save_collab_image("image.png"), "")
-        self.assertIn("浏览器兜底失败", saver.failures[0]["error"])
+        saver.fetch_base64 = Mock(side_effect=RuntimeError("cors"))
+        saver.fetch_base64_via_browser = Mock(side_effect=RuntimeError("response unavailable"))
+        saver.fetch_cache_base64 = Mock(return_value=None)
+
+        self.assertEqual(saver.save_collab_image("image.png"), "https://example.com/editor/kb/doc/resources/image.png")
+        saver.fetch_base64_via_browser.assert_called_once()
+        self.assertEqual(len(saver.failures), 1)
+
+    def test_trusted_image_timeout_with_failed_health_check_triggers_page_recovery(self):
+        saver = make_saver(FakeCdp([]))
+        saver.fetch_base64 = Mock(side_effect=TimeoutError("timed out"))
+
+        with patch(
+            "plugins.wiz.backend.export_wiz.check_wiz_page_health",
+            side_effect=TimeoutError("health timed out"),
+        ):
+            with self.assertRaises(WizPageSessionLost):
+                saver.save_collab_image("image.png")
 
 
 if __name__ == "__main__":
