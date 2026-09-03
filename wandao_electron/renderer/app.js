@@ -208,8 +208,10 @@ let activeTaskLogEntries = [];
 let logViewMode = localStorage.getItem('wandao-log-view') === 'detail' ? 'detail' : 'user';
 const MAX_TASK_HISTORY = 80;
 const TASK_HISTORY_RENDER_LIMIT = 20;
+const TASK_FAILURE_RENDER_LIMIT = 12;
 let taskHistory = [];
 let taskHistoryFilters = { query: '', status: 'all', providerId: 'all' };
+let taskHistoryVisibleLimit = TASK_HISTORY_RENDER_LIMIT;
 let activeHistoryTask = null;
 let latestFinishedTaskId = '';
 let taskHistoryLoadPromise = null;
@@ -1579,6 +1581,10 @@ function renderTaskHistoryFilterControls(filters) {
   if (clear) clear.disabled = !hasTaskHistoryFilters(taskHistoryFilters);
 }
 
+function resetTaskHistoryVisibleLimit() {
+  taskHistoryVisibleLimit = TASK_HISTORY_RENDER_LIMIT;
+}
+
 function clearTaskHistoryFilters() {
   taskHistoryFilters = { query: '', status: 'all', providerId: 'all' };
   const search = document.getElementById('task-history-search');
@@ -1587,6 +1593,7 @@ function clearTaskHistoryFilters() {
   if (search) search.value = '';
   if (status) status.value = 'all';
   if (provider) provider.value = 'all';
+  resetTaskHistoryVisibleLimit();
   renderTaskHistory();
 }
 
@@ -1594,12 +1601,12 @@ function taskHistorySelection(filters) {
   const selector = window.WandaoTaskHistory?.selectVisibleTasks;
   if (typeof selector === 'function') {
     return selector(taskHistory, filters, {
-      limit: TASK_HISTORY_RENDER_LIMIT,
+      limit: taskHistoryVisibleLimit,
       getStatus: taskDisplayStatus
     });
   }
-  const tasks = taskHistory.slice(0, TASK_HISTORY_RENDER_LIMIT);
-  return { tasks, total: tasks.length, hasMore: false };
+  const tasks = taskHistory.slice(0, taskHistoryVisibleLimit);
+  return { tasks, total: taskHistory.length, hasMore: taskHistory.length > taskHistoryVisibleLimit };
 }
 
 function renderTaskHistory() {
@@ -1655,7 +1662,10 @@ function renderTaskHistory() {
       </div>
     `;
   }).join('') + (hasMore
-    ? `<div class="task-history-more" role="status">为保持列表流畅，本次仅显示最新 ${TASK_HISTORY_RENDER_LIMIT} 条；还有 ${total - tasks.length} 条符合当前条件。请继续缩小关键词或筛选范围。</div>`
+    ? `<div class="task-history-more" role="status">
+        <span>已显示 ${tasks.length} / ${total} 条任务</span>
+        <button class="btn-secondary" type="button" data-history-action="load-more">加载更多任务（还有 ${total - tasks.length} 条）</button>
+      </div>`
     : '');
 }
 
@@ -1743,33 +1753,78 @@ function normalizedTaskReport(task) {
   };
 }
 
-function renderTaskFailureDetails(title, items, className, limit = 12) {
+function taskFailureGroups(task) {
+  const report = normalizedTaskReport(task);
+  const documentFailures = Array.isArray(report.documentFailures) ? report.documentFailures : [];
+  const imageFailures = Array.isArray(report.imageFailures) ? report.imageFailures : [];
+  const attachmentFailures = Array.isArray(report.attachmentFailures) ? report.attachmentFailures : [];
+  const otherResourceFailures = Array.isArray(report.resourceFailures)
+    ? report.resourceFailures.filter((item) => !['image', 'attachment'].includes(String(item?.type || item?.kind || '').toLowerCase()))
+    : [];
+  return { document: documentFailures, image: imageFailures, attachment: attachmentFailures, resource: otherResourceFailures };
+}
+
+function describeTaskFailureItem(item) {
+  const describe = window.WandaoTaskReport?.describeFailureItem || ((value) => JSON.stringify(value));
+  const parent = item?.document || item?.relativePath || '';
+  const resourceKind = String(item?.type || item?.kind || '').toLowerCase();
+  const subject = resourceKind === 'image' || resourceKind === 'attachment' || resourceKind === 'resource'
+    ? item?.url || item?.target || item?.file || item?.resource || item?.relativePath || item?.path || item?.document || ''
+    : item?.relativePath || item?.document || item?.title || item?.path || item?.id || item?.docId || item?.nodeId || item?.url || '';
+  // Resource descriptions already prefer their URL/file reference. Pass the
+  // document parent only when it adds context, avoiding a repeated path
+  // when a provider uses the same value for both fields.
+  const parentContext = parent && String(parent) !== String(subject) ? parent : '';
+  return describe(item, parentContext);
+}
+
+function renderTaskFailureDetails(title, items, className, limit = TASK_FAILURE_RENDER_LIMIT, taskId = '') {
   const list = Array.isArray(items) ? items : [];
   if (!list.length) return '';
   const shown = list.slice(0, limit);
-  const describe = window.WandaoTaskReport?.describeFailureItem || ((item) => JSON.stringify(item));
-  const describeItem = (item) => {
-    const parent = item?.document || item?.relativePath || '';
-    const resourceKind = String(item?.type || item?.kind || '').toLowerCase();
-    const subject = resourceKind === 'image' || resourceKind === 'attachment' || resourceKind === 'resource'
-      ? item?.url || item?.target || item?.file || item?.resource || item?.relativePath || item?.path || item?.document || ''
-      : item?.relativePath || item?.document || item?.title || item?.path || item?.id || item?.docId || item?.nodeId || item?.url || '';
-    // Resource descriptions already prefer their URL/file reference.  Pass
-    // the document parent only when it adds context, avoiding a repeated path
-    // when a provider uses the same value for both fields.
-    const parentContext = parent && String(parent) !== String(subject) ? parent : '';
-    return describe(item, parentContext);
-  };
   const more = list.length > shown.length
-    ? `<p class="task-history-detail-more">还有 ${list.length - shown.length} 项，可导出失败日志查看完整内容。</p>`
+    ? `<button class="btn-text task-history-detail-more" type="button"
+        data-history-action="expand-failures"
+        data-task-id="${escapeHtml(taskId)}"
+        data-failure-kind="${escapeHtml(className || 'resource')}"
+        data-failure-shown="${shown.length}"
+        data-failure-page-size="${limit}"
+        aria-label="继续展开${escapeHtml(title)}">继续展开（还有 ${list.length - shown.length} 项）</button>`
     : '';
   return `
     <section class="task-history-detail-block" data-failure-kind="${escapeHtml(className || 'resource')}">
       <h4>${escapeHtml(title)}（${list.length}）</h4>
-      <ul>${shown.map((item) => `<li>${escapeHtml(describeItem(item))}</li>`).join('')}</ul>
+      <ul>${shown.map((item) => `<li>${escapeHtml(describeTaskFailureItem(item))}</li>`).join('')}</ul>
       ${more}
     </section>
   `;
+}
+
+function expandTaskFailureDetails(button, task) {
+  if (!button || !task) return;
+  const section = button.closest('.task-history-detail-block');
+  const listElement = section?.querySelector('ul');
+  const kind = String(button.dataset.failureKind || 'resource');
+  const items = taskFailureGroups(task)[kind] || [];
+  if (!listElement || !items.length) {
+    button.remove();
+    return;
+  }
+  const shown = Math.min(items.length, Math.max(0, Number.parseInt(button.dataset.failureShown || '0', 10)) || 0);
+  const pageSize = Math.max(1, Number.parseInt(button.dataset.failurePageSize || String(TASK_FAILURE_RENDER_LIMIT), 10) || TASK_FAILURE_RENDER_LIMIT);
+  const nextItems = items.slice(shown, shown + pageSize);
+  nextItems.forEach((item) => {
+    const listItem = document.createElement('li');
+    listItem.textContent = describeTaskFailureItem(item);
+    listElement.appendChild(listItem);
+  });
+  const nextShown = shown + nextItems.length;
+  if (nextShown >= items.length) {
+    button.remove();
+    return;
+  }
+  button.dataset.failureShown = String(nextShown);
+  button.textContent = `继续展开（还有 ${items.length - nextShown} 项）`;
 }
 
 function renderTaskErrorProtocol(info) {
@@ -1801,12 +1856,7 @@ function taskNeedsFailureLog(task) {
 function taskHistoryDetailsHtml(task) {
   if (!taskNeedsFailureLog(task)) return '';
   const report = normalizedTaskReport(task);
-  const documentFailures = Array.isArray(report.documentFailures) ? report.documentFailures : [];
-  const imageFailures = Array.isArray(report.imageFailures) ? report.imageFailures : [];
-  const attachmentFailures = Array.isArray(report.attachmentFailures) ? report.attachmentFailures : [];
-  const otherResourceFailures = Array.isArray(report.resourceFailures)
-    ? report.resourceFailures.filter((item) => !['image', 'attachment'].includes(String(item?.type || item?.kind || '').toLowerCase()))
-    : [];
+  const { document: documentFailures, image: imageFailures, attachment: attachmentFailures, resource: otherResourceFailures } = taskFailureGroups(task);
   const errorInfo = report.errorInfo || task.errorInfo || null;
   const failurePreview = taskFailureDiagnostics(task, 12);
   const canResume = canResumeTask(task);
@@ -1817,10 +1867,10 @@ function taskHistoryDetailsHtml(task) {
     <details class="task-history-details">
       <summary>展开失败项与恢复建议</summary>
       <div class="task-history-details-content">
-        ${renderTaskFailureDetails('文档失败', documentFailures, 'document')}
-        ${renderTaskFailureDetails('图片失败', imageFailures, 'image')}
-        ${renderTaskFailureDetails('附件失败', attachmentFailures, 'attachment')}
-        ${renderTaskFailureDetails('其他资源失败', otherResourceFailures, 'resource')}
+        ${renderTaskFailureDetails('文档失败', documentFailures, 'document', TASK_FAILURE_RENDER_LIMIT, task.id)}
+        ${renderTaskFailureDetails('图片失败', imageFailures, 'image', TASK_FAILURE_RENDER_LIMIT, task.id)}
+        ${renderTaskFailureDetails('附件失败', attachmentFailures, 'attachment', TASK_FAILURE_RENDER_LIMIT, task.id)}
+        ${renderTaskFailureDetails('其他资源失败', otherResourceFailures, 'resource', TASK_FAILURE_RENDER_LIMIT, task.id)}
         ${!documentFailures.length && !imageFailures.length && !attachmentFailures.length && !otherResourceFailures.length && failurePreview.length ? `
           <section class="task-history-detail-block">
             <h4>关键失败摘要</h4>
@@ -6872,6 +6922,10 @@ function buildExportArgs(toolId, options = {}) {
     if (!forScan && downloadAttachments && !downloadAttachments.checked) {
       args.push('--skip-attachments');
     }
+    const includeSource = document.getElementById('yuque-include-source');
+    if (!forScan && includeSource && !includeSource.checked) {
+      args.push('--no-source');
+    }
   }
 
   if (!forScan && includeSelection) {
@@ -7421,7 +7475,8 @@ function isAllowedWhileRunningControl(control) {
   if (control.matches('[id$="-stop"], [id$="-login-done"], [data-task-orb-action], ' +
     '[data-history-action="copy"], [data-history-action="copy-failures"], ' +
     '[data-history-action="export-failure-log"], [data-history-action="open-output"], ' +
-    '[data-history-action="open-report"]')) {
+    '[data-history-action="open-report"], [data-history-action="load-more"], ' +
+    '[data-history-action="expand-failures"]')) {
     return true;
   }
   if (control.matches('[data-tool]')) return isPrimaryWorkbenchView(control.dataset.tool);
@@ -8192,14 +8247,17 @@ document.addEventListener('DOMContentLoaded', () => {
   });
   document.getElementById('task-history-search')?.addEventListener('input', (event) => {
     taskHistoryFilters.query = event.target.value;
+    resetTaskHistoryVisibleLimit();
     renderTaskHistory();
   });
   document.getElementById('task-history-status')?.addEventListener('change', (event) => {
     taskHistoryFilters.status = event.target.value;
+    resetTaskHistoryVisibleLimit();
     renderTaskHistory();
   });
   document.getElementById('task-history-provider')?.addEventListener('change', (event) => {
     taskHistoryFilters.providerId = event.target.value;
+    resetTaskHistoryVisibleLimit();
     renderTaskHistory();
   });
   document.getElementById('btn-history-clear-filters')?.addEventListener('click', clearTaskHistoryFilters);
@@ -8209,10 +8267,23 @@ document.addEventListener('DOMContentLoaded', () => {
       clearTaskHistoryFilters();
       return;
     }
+    if (button?.dataset.historyAction === 'load-more') {
+      taskHistoryVisibleLimit += TASK_HISTORY_RENDER_LIMIT;
+      renderTaskHistory();
+      document.querySelector('[data-history-action="load-more"]')?.scrollIntoView({
+        block: 'nearest',
+        behavior: 'smooth'
+      });
+      return;
+    }
     const item = event.target.closest('[data-task-id]');
     if (!button || !item) return;
     const task = taskHistory.find((entry) => entry.id === item.dataset.taskId);
     if (!task) return;
+    if (button.dataset.historyAction === 'expand-failures') {
+      expandTaskFailureDetails(button, task);
+      return;
+    }
     if (button.dataset.historyAction === 'copy-failures') {
       handleTaskAction(task, 'copy-failures')
         .catch((error) => log(`执行任务操作失败：${formatError(error)}`, 'error'));
