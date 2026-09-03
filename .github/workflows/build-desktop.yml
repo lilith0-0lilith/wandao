@@ -250,6 +250,33 @@ jobs:
           }
           $appExecutable = Get-ChildItem -LiteralPath $installRoot -Filter *.exe -File | Where-Object { $_.BaseName -ieq "wandao" } | Select-Object -First 1
           if (-not $appExecutable) { throw "Installed Wandao executable was not found" }
+          $expectedVersion = (Get-Content -Raw wandao_electron/package.json | ConvertFrom-Json).version
+          $uninstall = Get-ItemProperty -LiteralPath "HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\Wandao" -ErrorAction SilentlyContinue
+          if (-not $uninstall) { throw "Wandao uninstall registry entry was not created" }
+          if ($uninstall.DisplayVersion -ne $expectedVersion) {
+            throw "Installed registry version is $($uninstall.DisplayVersion), expected $expectedVersion"
+          }
+          $registeredRoot = ([string]$uninstall.InstallLocation).Trim('"')
+          if (-not [string]::Equals($registeredRoot, $installRoot, [System.StringComparison]::OrdinalIgnoreCase)) {
+            throw "Installed registry path is $registeredRoot, expected $installRoot"
+          }
+          $expectedUninstaller = Join-Path $installRoot "uninstall.exe"
+          $registeredUninstaller = ([string]$uninstall.UninstallString).Trim('"')
+          if (-not [string]::Equals($registeredUninstaller, $expectedUninstaller, [System.StringComparison]::OrdinalIgnoreCase)) {
+            throw "Installed uninstall path is $registeredUninstaller, expected $expectedUninstaller"
+          }
+          $shell = New-Object -ComObject WScript.Shell
+          $shortcutPaths = @(
+            (Join-Path $env:APPDATA "Microsoft\Windows\Start Menu\Programs\Wandao.lnk"),
+            (Join-Path $env:USERPROFILE "Desktop\Wandao.lnk")
+          )
+          foreach ($shortcutPath in $shortcutPaths) {
+            if (-not (Test-Path -LiteralPath $shortcutPath)) { throw "Installed shortcut was not created: $shortcutPath" }
+            $shortcut = $shell.CreateShortcut($shortcutPath)
+            if (-not [string]::Equals($shortcut.TargetPath, $appExecutable.FullName, [System.StringComparison]::OrdinalIgnoreCase)) {
+              throw "Shortcut $shortcutPath targets $($shortcut.TargetPath), expected $($appExecutable.FullName)"
+            }
+          }
           "WANDAO_SMOKE_RESOURCES=$installRoot" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
           "WANDAO_SMOKE_EXECUTABLE=$($appExecutable.FullName)" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
 

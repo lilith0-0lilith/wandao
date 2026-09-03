@@ -172,6 +172,23 @@
   wandao_legacy_done:
 !macroend
 
+; The updater invokes this installer in /UPDATE mode. Re-assert the final
+; install identity after copying files so Windows shell entries and
+; Add/Remove Programs cannot retain an older install root or version.
+!macro NSIS_HOOK_POSTINSTALL
+  WriteRegStr SHCTX "${MANUPRODUCTKEY}" "" $INSTDIR
+  WriteRegStr SHCTX "${UNINSTKEY}" "MainBinaryName" "${MAINBINARYNAME}.exe"
+  WriteRegStr SHCTX "${UNINSTKEY}" "DisplayName" "${PRODUCTNAME}"
+  WriteRegStr SHCTX "${UNINSTKEY}" "DisplayIcon" "$\"$INSTDIR\${MAINBINARYNAME}.exe$\""
+  WriteRegStr SHCTX "${UNINSTKEY}" "DisplayVersion" "${VERSION}"
+  WriteRegStr SHCTX "${UNINSTKEY}" "Publisher" "${MANUFACTURER}"
+  WriteRegStr SHCTX "${UNINSTKEY}" "InstallLocation" "$\"$INSTDIR$\""
+  WriteRegStr SHCTX "${UNINSTKEY}" "UninstallString" "$\"$INSTDIR\uninstall.exe$\""
+  WriteRegDWORD SHCTX "${UNINSTKEY}" "NoModify" "1"
+  WriteRegDWORD SHCTX "${UNINSTKEY}" "NoRepair" "1"
+  Call WandaoRepairExistingShortcuts
+!macroend
+
 ; Tauri's stock template targets $APPDATA\${BUNDLEID}; Wandao deliberately
 ; preserves Electron's historical $APPDATA\wandao data directory instead.
 !macro NSIS_HOOK_POSTUNINSTALL
@@ -181,3 +198,16 @@
     RMDir /r "$APPDATA\wandao"
   ${EndIf}
 !macroend
+
+Function WandaoRepairExistingShortcuts
+  ; Keep user-deleted shortcuts deleted, but repair any remaining product
+  ; shortcut that still targets an older executable.
+  ${If} ${FileExists} "$SMPROGRAMS\Wandao.lnk"
+    !insertmacro SetShortcutTarget "$SMPROGRAMS\Wandao.lnk" "$INSTDIR\wandao.exe"
+    !insertmacro SetLnkAppUserModelId "$SMPROGRAMS\Wandao.lnk"
+  ${EndIf}
+  ${If} ${FileExists} "$DESKTOP\Wandao.lnk"
+    !insertmacro SetShortcutTarget "$DESKTOP\Wandao.lnk" "$INSTDIR\wandao.exe"
+    !insertmacro SetLnkAppUserModelId "$DESKTOP\Wandao.lnk"
+  ${EndIf}
+FunctionEnd
