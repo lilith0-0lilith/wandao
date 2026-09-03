@@ -466,6 +466,16 @@ jobs:
       - name: List release files
         run: find release-artifacts -type f
 
+      - name: Prepare release description
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          awk -v heading="## ${version}" '
+            $0 == heading { found=1; print; next }
+            found && /^## / { exit }
+            found { print }
+          ' RELEASE_NOTES.md > release-body.md
+          test -s release-body.md
+
       - name: Generate updater manifest
         run: |
           python scripts/build_updater_manifest.py \
@@ -494,7 +504,8 @@ jobs:
         with:
           tag_name: ${{ github.ref_name }}
           name: Wandao ${{ github.ref_name }}
-          generate_release_notes: true
+          body_path: release-body.md
+          generate_release_notes: false
           draft: true
           make_latest: false
           fail_on_unmatched_files: true
