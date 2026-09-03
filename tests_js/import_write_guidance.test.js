@@ -23,8 +23,8 @@ test('Yuque single and batch imports require a source, target, and overwrite con
   assert.match(confirmation, /platform: '语雀'/);
   assert.match(confirmation, /source: sourceDir/);
   assert.match(confirmation, /同名文档存在时会更新其内容/);
-  assert.match(handlers, /const args = buildYuqueImportArgs\(\{ single: true \}\);[\s\S]*if \(!confirmYuqueImportWrite\(\{ single: true \}\)\) return;[\s\S]*runYuqueImportCommand\(args/);
-  assert.match(exportHandler, /toolId === 'yuque-import' && !confirmYuqueImportWrite\(\)/);
+  assert.match(handlers, /const args = buildYuqueImportArgs\(\{ single: true \}\);[\s\S]*if \(!\(await confirmYuqueImportWrite\(\{ single: true \}\)\)\) return;[\s\S]*runYuqueImportCommand\(args/);
+  assert.match(exportHandler, /toolId === 'yuque-import' && !\(await confirmYuqueImportWrite\(\)\)/);
   assert.doesNotMatch(handlers, /retryFailures: true\}\), '语雀重试失败文档'[\s\S]*confirmYuqueImportWrite/);
 });
 

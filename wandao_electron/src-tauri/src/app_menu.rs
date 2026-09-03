@@ -216,7 +216,7 @@ fn task_event_sink(app: AppHandle) -> TaskEventSink {
             let _ = app.emit("python-log", text);
         }
         TaskRuntimeEvent::StructuredLog { .. } => {}
-        TaskRuntimeEvent::Diagnostic { level, message } => {
+        TaskRuntimeEvent::Diagnostic { level, message, .. } => {
             let prefix = match level {
                 DiagnosticLevel::Info => "",
                 DiagnosticLevel::Warn => "警告：",

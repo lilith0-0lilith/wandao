@@ -6,29 +6,26 @@ body:
   - type: markdown
     attributes:
       value: |
-        请简单说明希望新增或修改的内容。
+        请简单写清楚希望新增、修改或纠正什么。
 
-        如果想认领这个 Issue，请直接在评论区回复“认领”，不需要在表单中填写认领计划。
-
-        请先脱敏，不要提交私人内容或账号凭证。
+        如果想认领，请在 Issue 评论区回复“认领”。请先脱敏，不要提交账号凭证或私人内容。
   - type: checkboxes
     id: precheck
     attributes:
       label: 提交前确认（可选）
       options:
-        - label: 我已经搜索过已有 Issue 和 PR，暂时没有找到相同建议。
-        - label: 我已经确认内容和截图中没有敏感信息。
+        - label: 我已经搜索过已有 Issue 和 PR。
+        - label: 内容和截图中没有敏感信息。
   - type: textarea
     id: description
     attributes:
       label: 文档建议
-      description: 请说明哪里需要补充、修改或纠正。
-      placeholder: 例如：建议补充 macOS 首次打开应用时的处理说明。
+      description: 请说明问题所在，以及希望读者最终能看懂或完成什么。
+      placeholder: 例如：补充 macOS 首次打开应用时的排障步骤。
     validations:
       required: true
   - type: textarea
     id: references
     attributes:
       label: 参考资料或截图（可选）
-      description: 可以提供公开链接、截图或示例内容。
-
+      description: 可直接拖入截图，或粘贴公开链接、示例内容。

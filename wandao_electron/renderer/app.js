@@ -20,6 +20,7 @@ let pluginCatalogState = { status: 'idle', plugins: [], query: '', error: '', of
 let pluginCatalogRequestId = 0;
 const pluginOperationState = new Map();
 let pluginBulkUpdateRunning = false;
+let pluginOperationNotice = null;
 let updateCheckPromise = null;
 let updateCheckAnnounce = false;
 let customPluginMessageCleanup = null;
@@ -169,6 +170,11 @@ let pythonProgressBuffer = '';
 let pythonLogSummaryBuffer = '';
 let pythonLogProcessor = null;
 let progressVisible = false;
+let progressStartedAt = 0;
+let progressHeartbeatTimer = null;
+let progressBaseDetail = '';
+let progressPhase = 'task';
+let progressHasRealProgress = false;
 let latestReleaseUrl = 'https://github.com/tllovesxs/wandao/releases/latest';
 let updateInstalling = false;
 let latestYuqueImportReportFile = '';
@@ -193,6 +199,7 @@ let appSettingsState = {
 };
 const MAX_LOG_ENTRIES = 2000;
 const LOG_PANEL_RENDER_LIMIT = 400;
+const LOG_INLINE_PREVIEW_LIMIT = 640;
 const MAX_TASK_LOG_ENTRIES = 2000;
 const userLogEntries = [];
 const detailLogEntries = [];
@@ -206,6 +213,8 @@ let activeHistoryTask = null;
 let latestFinishedTaskId = '';
 let taskHistoryLoadPromise = null;
 let taskHistoryLoadError = '';
+let dismissedTaskStatusOrbId = '';
+const ONBOARDING_DISMISSED_STORAGE_KEY = 'wandao-onboarding-v1-dismissed';
 const FORM_DRAFTS = window.WandaoFormDrafts;
 const RECENT_INPUTS = window.WandaoRecentInputs;
 let activeFormDraftContext = null;
@@ -260,17 +269,21 @@ function recordCurrentRecentInputs(providerId = currentTool) {
   return result;
 }
 
-function clearRememberedFormInputs() {
-  if (!confirm('清除最近输入和未提交表单草稿？\n\n登录凭证、API 配置和任务历史不会被删除。')) return;
+async function clearRememberedFormInputs() {
+  if (!(await confirmUserAction('清除最近输入和未提交表单草稿？\n\n登录凭证、API 配置和任务历史不会被删除。', {
+    title: '清除表单记忆',
+    confirmLabel: '清除',
+    danger: true
+  }))) return;
   const recentCleared = RECENT_INPUTS?.clearAll?.(draftStorage()) ?? true;
   const draftsCleared = FORM_DRAFTS?.clearAll?.(draftStorage()) ?? true;
   if (!recentCleared || !draftsCleared) {
-    alert('部分本机表单记录清除失败，请重启应用后重试。');
+    notifyUser('部分本机表单记录清除失败，请重启应用后重试。', 'warn');
     return;
   }
   recentInputControllers.forEach((controller) => controller.render?.());
   log('已清除最近输入和未提交表单草稿。登录凭证、API 配置和任务历史未受影响。', 'success');
-  alert('表单记忆已清除。');
+  notifyUser('表单记忆已清除。', 'success');
 }
 
 function saveCurrentFormDraft() {
@@ -587,7 +600,7 @@ async function checkForUpdates(silent = false) {
     if (updateCheckAnnounce) {
       const level = application.success && plugins?.success ? 'success' : 'warn';
       log(`更新检查完成：${summary.appText} ${summary.pluginText}`, level);
-      alert(`${summary.appText}\n${summary.pluginText}`);
+      notifyUser(`${summary.appText}\n${summary.pluginText}`, level, { title: '更新检查完成', duration: 7000 });
     }
     return { application, plugins, ...summary };
   })();
@@ -602,11 +615,11 @@ async function checkForUpdates(silent = false) {
 
 async function installUpdate() {
   if (!window.electronAPI.installUpdate) {
-    alert('当前版本暂不支持程序内更新，请前往 Releases 下载。');
+    notifyUser('当前版本暂不支持程序内更新，请前往 Releases 下载。', 'info');
     return;
   }
   if (isRunning || mainPythonProcessState.running) {
-    alert('当前有迁移任务正在运行，请先等待任务完成或停止任务后再更新。');
+    notifyUser('当前有迁移任务正在运行，请先等待任务完成或停止任务后再更新。', 'warn');
     return;
   }
   const button = document.getElementById('btn-install-update');
@@ -628,7 +641,7 @@ async function installUpdate() {
     }
     if (detail) detail.textContent = `更新失败：${formatError(error)}`;
     log(`程序更新失败：${formatError(error)}`, 'error');
-    alert(`程序更新失败：${formatError(error)}`);
+    notifyError(error, { title: '程序更新失败' });
   }
 }
 
@@ -667,6 +680,7 @@ function appendDetailedLog(source, type, message, meta = {}) {
     message: normalizeLogMessage(message),
     event: meta.event || '',
     provider: meta.provider || '',
+    errorInfo: meta.errorInfo || meta.data?.errorInfo || null,
     data: meta.data || null
   };
   detailLogEntries.push(entry);
@@ -723,7 +737,23 @@ function createLogEntryElement(message, type = 'info', time = new Date().toISOSt
     code.textContent = 'WANNENGDAO';
     entry.append(label, code, document.createTextNode(' — 登录后在工作台「兑换」输入，即可获得 $3 API 额度。'));
   } else {
-    entry.appendChild(document.createTextNode(message));
+    const text = String(message || '');
+    if (text.length > LOG_INLINE_PREVIEW_LIMIT) {
+      const preview = document.createElement('span');
+      preview.className = 'log-entry-preview';
+      preview.textContent = `${text.slice(0, LOG_INLINE_PREVIEW_LIMIT)}…`;
+      const details = document.createElement('details');
+      details.className = 'log-entry-details';
+      const summary = document.createElement('summary');
+      summary.textContent = `查看完整内容（${text.length} 字）`;
+      const full = document.createElement('pre');
+      full.className = 'log-entry-full';
+      full.textContent = text;
+      details.append(summary, full);
+      entry.append(preview, details);
+    } else {
+      entry.appendChild(document.createTextNode(text));
+    }
   }
   return entry;
 }
@@ -877,11 +907,70 @@ function extractErrorSummary(raw, maxLength = 220) {
 }
 
 function formatUserError(message) {
+  const runtimeRoot = typeof window !== 'undefined' ? window : globalThis;
+  const protocol = runtimeRoot.WandaoErrorProtocol?.normalizeError;
+  if (typeof protocol === 'function') {
+    const info = protocol(message);
+    const raw = normalizeLogMessage(message);
+    const summary = extractErrorSummary(raw);
+    const suffix = summary && !info.explicit ? `\n原始摘要：${summary}` : '';
+    const category = runtimeRoot.WandaoErrorProtocol?.categoryLabel?.(info.category, info.categoryLabel || '操作失败')
+      || info.categoryLabel
+      || info.userMessage
+      || '操作失败';
+    return `${category}：${info.userMessage}。${info.recovery || ''}${suffix}`.trim();
+  }
   const raw = normalizeLogMessage(message);
   const rule = classifyError(raw);
   const summary = extractErrorSummary(raw);
   const suffix = summary ? `\n原始摘要：${summary}` : '';
   return `${rule.category}：${rule.title}。${rule.suggestion}${suffix}`;
+}
+
+function normalizeErrorInfo(error, context = {}) {
+  const runtimeRoot = typeof window !== 'undefined' ? window : globalThis;
+  const protocol = runtimeRoot.WandaoErrorProtocol?.normalizeError;
+  if (typeof protocol === 'function') return protocol(error, context);
+  return {
+    kind: 'wandao.error',
+    schemaVersion: 1,
+    code: 'UNKNOWN_ERROR',
+    category: 'unknown',
+    userMessage: formatError(error),
+    recovery: '',
+    retryable: true,
+    correlationId: ''
+  };
+}
+
+function notifyUser(message, type = 'info', options = {}) {
+  const runtimeRoot = typeof window !== 'undefined' ? window : globalThis;
+  const feedback = runtimeRoot.WandaoFeedback;
+  if (feedback?.notify) return feedback.notify(message, { type, ...options });
+  log(message, type, { forceDisplay: true });
+  return null;
+}
+
+function notifyError(error, options = {}) {
+  const info = normalizeErrorInfo(error, options);
+  const runtimeRoot = typeof window !== 'undefined' ? window : globalThis;
+  const feedback = runtimeRoot.WandaoFeedback;
+  if (feedback?.error) return feedback.error(info, {
+    ...options,
+    title: options.title || runtimeRoot.WandaoErrorProtocol?.categoryLabel?.(info.category, info.categoryLabel || '操作失败') || info.categoryLabel || '操作失败'
+  });
+  log(`${info.userMessage}。${info.recovery || ''}`.trim(), 'error', { forceDisplay: true });
+  return null;
+}
+
+async function confirmUserAction(message, options = {}) {
+  const runtimeRoot = typeof window !== 'undefined' ? window : globalThis;
+  const feedback = runtimeRoot.WandaoFeedback;
+  if (feedback?.confirm) return feedback.confirm(message, options);
+  // The desktop feedback layer is loaded before app.js.  If a stripped-down
+  // host omits it, fail open as a Promise instead of resurrecting a blocking
+  // native confirm dialog in the middle of a task.
+  return true;
 }
 
 function log(message, type = 'info', options = {}) {
@@ -956,7 +1045,8 @@ function formatDeveloperDetailEntry(entry) {
   const provider = entry.provider ? ` [provider:${entry.provider}]` : '';
   const data = stringifyDiagnosticData(entry.data);
   const suffix = data ? ` | data=${data}` : '';
-  return `[${formatUserDateTime(entry.time)}] [${entry.source}] [${entry.type}]${event}${provider} ${entry.message}${suffix}`;
+  const errorInfo = entry.errorInfo?.code ? ` | errorCode=${entry.errorInfo.code}${entry.errorInfo.correlationId ? ` | correlationId=${entry.errorInfo.correlationId}` : ''}` : '';
+  return `[${formatUserDateTime(entry.time)}] [${entry.source}] [${entry.type}]${event}${provider} ${entry.message}${errorInfo}${suffix}`;
 }
 
 function activeToolLabel() {
@@ -1044,7 +1134,26 @@ function extractTaskStats(data, errorText = '') {
 }
 
 function taskSummary(task) {
-  return window.WandaoTaskReport?.summarizeStats(task.report?.stats || task.stats || {}, task.error) || '暂无统计信息';
+  const report = normalizedTaskReport(task);
+  return window.WandaoTaskReport?.summarizeStats(report.stats || task.stats || {}, task.error) || '暂无统计信息';
+}
+
+function taskHistoryBreakdownHtml(task) {
+  const report = normalizedTaskReport(task);
+  const stats = report?.stats || {};
+  const documentFailures = taskDocumentFailureCount(task);
+  const parts = [];
+  if (Number(stats.success) > 0) parts.push(['正文成功', stats.success, 'success']);
+  if (documentFailures > 0) parts.push(['文档失败', documentFailures, 'danger']);
+  if (Number(stats.imageSuccess) > 0) parts.push(['图片成功', stats.imageSuccess, 'success']);
+  if (Number(stats.imageFailed) > 0) parts.push(['图片失败', stats.imageFailed, 'warning']);
+  if (Number(stats.attachmentSuccess) > 0) parts.push(['附件成功', stats.attachmentSuccess, 'success']);
+  if (Number(stats.attachmentFailed) > 0) parts.push(['附件失败', stats.attachmentFailed, 'warning']);
+  const typedResourceCount = Math.max(0, Number(stats.imageFailed) || 0) + Math.max(0, Number(stats.attachmentFailed) || 0);
+  const genericResourceCount = Math.max(0, Number(stats.resourceFailed) || 0) - typedResourceCount;
+  if (genericResourceCount > 0) parts.push(['其他资源失败', genericResourceCount, 'warning']);
+  if (!parts.length) return '';
+  return `<div class="task-history-breakdown" aria-label="任务分项统计">${parts.map(([label, count, tone]) => `<span class="task-history-breakdown-item ${tone}"><span>${escapeHtml(label)}</span><strong>${escapeHtml(String(count))}</strong></span>`).join('')}</div>`;
 }
 
 function taskArtifactPaths(task) {
@@ -1082,6 +1191,7 @@ function taskDisplayStatus(task) {
 function taskReportForResult(result, options = {}) {
   return window.WandaoTaskReport?.normalizeTaskReport(result?.data, {
     errorText: options.errorText || result?.error || '',
+    errorInfo: options.errorInfo || result?.errorInfo || result?.data?.errorInfo,
     provider: options.provider,
     mode: options.mode
   }) || null;
@@ -1104,22 +1214,42 @@ function taskResultStatus(result, options = {}) {
   }) || fallbackStatus;
 }
 
-function finishProgressForTaskResult(result, completedDetail, options = {}) {
+function taskResultCompletionState(result, completedDetail, options = {}) {
   const report = options.report || taskReportForResult(result, options);
   const status = taskResultStatus(result, { ...options, report });
   if (status === 'partial') {
     const summary = window.WandaoTaskReport?.summarizeStats(report?.stats || {}, '') || '部分项目未完成';
-    finishProgress('partial', completedDetail + '，' + summary + '。请在任务历史查看失败项。');
-  } else if (status === 'stopped') {
-    finishProgress('stopped', options.stoppedDetail || (completedDetail + '已停止'));
-  } else if (status === 'paused') {
-    finishProgress('paused', options.pausedDetail || (completedDetail + '因频率限制安全暂停，可在任务历史继续'));
-  } else if (status === 'completed') {
-    finishProgress('completed', completedDetail);
-  } else {
-    finishProgress('failed', options.failedDetail || (completedDetail + '失败，请查看运行日志'));
+    const provider = typeof options.provider === 'string' ? TOOLS[options.provider] : options.provider;
+    const recovery = providerRetryFailureArg(provider)
+      ? '可点击任务提示中的“重试失败项”直接重试，也可在任务中心查看失败项。'
+      : '请在任务中心查看失败项。';
+    return { report, status, detail: completedDetail + '，' + summary + '。' + recovery };
   }
-  return status;
+  if (status === 'stopped') {
+    return { report, status, detail: options.stoppedDetail || (completedDetail + '已停止') };
+  }
+  if (status === 'paused') {
+    return { report, status, detail: options.pausedDetail || (completedDetail + '因频率限制安全暂停，可在任务中心继续') };
+  }
+  if (status === 'completed') {
+    return { report, status, detail: completedDetail };
+  }
+  return { report, status: 'failed', detail: options.failedDetail || (completedDetail + '失败，请查看运行日志') };
+}
+
+function finishProgressForTaskResult(result, completedDetail, options = {}) {
+  const state = taskResultCompletionState(result, completedDetail, options);
+  finishProgress(state.status, state.detail);
+  return state.status;
+}
+
+function logTaskResultCompletion(result, completedDetail, options = {}) {
+  const state = taskResultCompletionState(result, completedDetail, options);
+  const type = state.status === 'completed'
+    ? 'success'
+    : (['partial', 'stopped', 'paused'].includes(state.status) ? 'warn' : 'error');
+  log(state.detail, type);
+  return state.status;
 }
 
 function setLogCollapsed(collapsed) {
@@ -1192,10 +1322,17 @@ function taskResumeActionLabel(task) {
     const count = (task.report?.deferred || task.resultData?.deferred || []).length;
     return `继续任务（${count} 篇待处理）`;
   }
-  if ((status === 'completed' || status === 'partial') && retryableFailures > 0) {
+  const supportsFailureRetry = Boolean(providerRetryFailureArg(TOOLS[task?.providerId] || {}));
+  if (supportsFailureRetry && (status === 'completed' || status === 'partial') && retryableFailures > 0) {
     return `重试失败项${retryableFailures > 1 ? `（${retryableFailures}）` : ''}`;
   }
   return '继续任务';
+}
+
+function taskResumeSubject(task) {
+  const raw = String(task?.title || task?.providerTitle || task?.script || '未命名任务').trim();
+  const withoutPriorAction = raw.replace(/^(?:(?:继续任务|重试失败项)(?:（[^）]*）|\([^)]*\))?\s*[:：]\s*)+/u, '').trim();
+  return withoutPriorAction || raw;
 }
 
 async function performTaskHistoryLoad() {
@@ -1234,10 +1371,34 @@ async function performTaskHistoryLoad() {
     } else {
       task.args = [];
     }
+    if (!task.errorInfo && task.error) {
+      task.errorInfo = normalizeErrorInfo(task.error, {
+        provider: task.providerId,
+        operation: task.action
+      });
+      needsMigration = true;
+    }
+    if (!task.originView) {
+      task.originView = task.providerId || 'platform-center';
+      needsMigration = true;
+    }
+    const savedProgress = task.progress && typeof task.progress === 'object' ? task.progress : {};
+    if (!task.progress || typeof task.progress !== 'object') needsMigration = true;
+    task.progress = {
+      current: Math.max(0, Number(savedProgress.current) || 0),
+      total: Math.max(0, Number(savedProgress.total) || 0),
+      detail: String(savedProgress.detail || '')
+    };
     return task;
   }));
+  const runningTaskId = mainPythonProcessState.taskId;
+  activeHistoryTask = taskHistory.find((task) => (
+    ['running', 'stopping'].includes(task.status)
+    && (!runningTaskId || task.id === runningTaskId)
+  )) || null;
   if (needsMigration) await saveTaskHistory();
   renderTaskHistory();
+  renderTaskStatusOrb();
 }
 
 function loadTaskHistory() {
@@ -1283,6 +1444,7 @@ async function saveTaskHistory() {
     }
     persistable.resultData = maskSensitiveValue(persistable.resultData);
     persistable.report = maskSensitiveValue(persistable.report);
+    persistable.errorInfo = maskSensitiveValue(persistable.errorInfo);
     persistable.error = maskSensitiveText(persistable.error || '');
     persistable.logs = maskSensitiveValue(persistable.logs || []);
     return persistable;
@@ -1400,13 +1562,9 @@ function renderTaskHistory() {
     const displayStatus = taskDisplayStatus(task);
     const canResume = canResumeTask(task);
     const paths = taskArtifactPaths(task);
-    const failurePreview = taskFailurePreview(task);
     const failureCount = taskFailureCount(task);
-    const documentFailureCount = taskDocumentFailureCount(task);
     const resumeReason = resumeTaskDisabledReason(task);
-    const failureTone = displayStatus === 'partial' && documentFailureCount === 0
-      ? 'task-history-failures warning'
-      : 'task-history-failures';
+    const canExportFailureLog = taskNeedsFailureLog(task);
     return `
       <div class="task-history-item" data-task-id="${escapeHtml(task.id)}">
         <div class="task-history-main">
@@ -1420,17 +1578,15 @@ function renderTaskHistory() {
           <div class="task-history-buttons">
             <button class="btn-text" type="button" data-history-action="copy">复制报告</button>
             ${failureCount ? '<button class="btn-text" type="button" data-history-action="copy-failures" aria-label="复制此任务的失败项">复制失败项</button>' : ''}
+            ${canExportFailureLog ? '<button class="btn-text" type="button" data-history-action="export-failure-log">导出失败日志</button>' : ''}
             ${paths.reportFile ? '<button class="btn-text" type="button" data-history-action="open-report">打开报告</button>' : ''}
             ${paths.output ? '<button class="btn-text" type="button" data-history-action="open-output">打开输出</button>' : ''}
             <button class="btn-text" type="button" data-history-action="resume" ${canResume ? '' : 'disabled'} title="${escapeHtml(resumeReason)}">${escapeHtml(taskResumeActionLabel(task))}</button>
           </div>
         </div>
         <div class="task-history-summary">${escapeHtml(taskSummary(task))}</div>
-        ${failurePreview.length ? `
-          <div class="${failureTone}">
-            ${failurePreview.map((line) => `<div>${escapeHtml(line)}</div>`).join('')}
-          </div>
-        ` : ''}
+        ${taskHistoryBreakdownHtml(task)}
+        ${taskHistoryDetailsHtml(task)}
       </div>
     `;
   }).join('') + (hasMore
@@ -1493,70 +1649,281 @@ function announceTaskOutcome(task) {
   announcer.textContent = `任务“${task.title || task.providerTitle || '未命名任务'}”${status}。${summary}`;
 }
 
-function focusTaskResultCard() {
-  const card = document.getElementById('task-result-card');
-  if (!card || card.hidden) return;
-  window.requestAnimationFrame(() => card.focus({ preventScroll: false }));
+function normalizedTaskReport(task) {
+  const storedReport = task?.report && typeof task.report === 'object' ? task.report : {};
+  const reportRaw = storedReport.raw && typeof storedReport.raw === 'object' ? storedReport.raw : {};
+  const resultData = task?.resultData && typeof task.resultData === 'object' ? task.resultData : {};
+  const source = {
+    ...resultData,
+    ...reportRaw,
+    ...storedReport,
+    stats: {
+      ...(resultData.stats && typeof resultData.stats === 'object' ? resultData.stats : {}),
+      ...(reportRaw.stats && typeof reportRaw.stats === 'object' ? reportRaw.stats : {}),
+      ...(storedReport.stats && typeof storedReport.stats === 'object' ? storedReport.stats : {})
+    }
+  };
+  return window.WandaoTaskReport?.normalizeTaskReport(source, {
+    errorText: task?.error,
+    errorInfo: task?.errorInfo,
+    provider: task?.providerId,
+    mode: task?.action
+  }) || {
+    stats: {},
+    documentFailures: [],
+    resourceFailures: [],
+    imageFailures: [],
+    attachmentFailures: [],
+    errorInfo: null
+  };
 }
 
-function renderTaskResultCard(task = latestFinishedTask()) {
-  const card = document.getElementById('task-result-card');
-  if (!card) return;
-  if (!task) {
-    card.hidden = true;
-    card.replaceChildren();
+function renderTaskFailureDetails(title, items, className, limit = 12) {
+  const list = Array.isArray(items) ? items : [];
+  if (!list.length) return '';
+  const shown = list.slice(0, limit);
+  const describe = window.WandaoTaskReport?.describeFailureItem || ((item) => JSON.stringify(item));
+  const describeItem = (item) => {
+    const parent = item?.document || item?.relativePath || '';
+    const resourceKind = String(item?.type || item?.kind || '').toLowerCase();
+    const subject = resourceKind === 'image' || resourceKind === 'attachment' || resourceKind === 'resource'
+      ? item?.url || item?.target || item?.file || item?.resource || item?.relativePath || item?.path || item?.document || ''
+      : item?.relativePath || item?.document || item?.title || item?.path || item?.id || item?.docId || item?.nodeId || item?.url || '';
+    // Resource descriptions already prefer their URL/file reference.  Pass
+    // the document parent only when it adds context, avoiding a repeated path
+    // when a provider uses the same value for both fields.
+    const parentContext = parent && String(parent) !== String(subject) ? parent : '';
+    return describe(item, parentContext);
+  };
+  const more = list.length > shown.length
+    ? `<p class="task-history-detail-more">还有 ${list.length - shown.length} 项，可导出失败日志查看完整内容。</p>`
+    : '';
+  return `
+    <section class="task-history-detail-block" data-failure-kind="${escapeHtml(className || 'resource')}">
+      <h4>${escapeHtml(title)}（${list.length}）</h4>
+      <ul>${shown.map((item) => `<li>${escapeHtml(describeItem(item))}</li>`).join('')}</ul>
+      ${more}
+    </section>
+  `;
+}
+
+function renderTaskErrorProtocol(info) {
+  if (!info) return '';
+  return `
+    <section class="task-history-error-protocol">
+      <h4>错误信息：${escapeHtml(info.code || 'UNKNOWN_ERROR')}</h4>
+      <div class="task-history-error-grid">
+        <span>用户提示</span><strong>${escapeHtml(info.userMessage || '任务执行失败')}</strong>
+        <span>恢复建议</span><strong>${escapeHtml(info.recovery || '请查看详细日志后重试。')}</strong>
+        <span>可重试</span><strong>${info.retryable ? '是' : '否'}</strong>
+        ${info.correlationId ? `<span>关联 ID</span><code>${escapeHtml(info.correlationId)}</code>` : ''}
+      </div>
+    </section>
+  `;
+}
+
+function taskNeedsFailureLog(task) {
+  const report = normalizedTaskReport(task);
+  const status = taskDisplayStatus(task);
+  return Boolean(
+    taskFailureCount(task)
+    || task?.error
+    || report?.errorInfo
+    || ['partial', 'failed', 'interrupted', 'paused'].includes(status)
+  );
+}
+
+function taskHistoryDetailsHtml(task) {
+  if (!taskNeedsFailureLog(task)) return '';
+  const report = normalizedTaskReport(task);
+  const documentFailures = Array.isArray(report.documentFailures) ? report.documentFailures : [];
+  const imageFailures = Array.isArray(report.imageFailures) ? report.imageFailures : [];
+  const attachmentFailures = Array.isArray(report.attachmentFailures) ? report.attachmentFailures : [];
+  const errorInfo = report.errorInfo || task.errorInfo || null;
+  const failurePreview = taskFailureDiagnostics(task, 12);
+  const canResume = canResumeTask(task);
+  const recovery = canResume
+    ? `${taskResumeActionLabel(task)}后，万能导会尽量保留已完成内容，只处理仍需处理的项目。`
+    : (errorInfo?.recovery || '请查看失败日志，确认输入、权限或网络后重新执行。');
+  return `
+    <details class="task-history-details">
+      <summary>展开失败项与恢复建议</summary>
+      <div class="task-history-details-content">
+        ${renderTaskFailureDetails('文档失败', documentFailures, 'document')}
+        ${renderTaskFailureDetails('图片失败', imageFailures, 'image')}
+        ${renderTaskFailureDetails('附件失败', attachmentFailures, 'attachment')}
+        ${!documentFailures.length && !imageFailures.length && !attachmentFailures.length && failurePreview.length ? `
+          <section class="task-history-detail-block">
+            <h4>关键失败摘要</h4>
+            <ul>${failurePreview.map((line) => `<li>${escapeHtml(line)}</li>`).join('')}</ul>
+          </section>
+        ` : ''}
+        ${renderTaskErrorProtocol(errorInfo)}
+        <section class="task-history-recovery">
+          <h4>下一步</h4>
+          <p>${escapeHtml(recovery)}</p>
+        </section>
+      </div>
+    </details>
+  `;
+}
+
+function activeTaskStatusOrbTask() {
+  return activeHistoryTask || latestFinishedTask();
+}
+
+function canRetryFailureItems(task) {
+  if (!task || taskHasDeferredDocuments(task)) return false;
+  const status = taskDisplayStatus(task);
+  if (!['completed', 'partial', 'failed'].includes(status)) return false;
+  return Boolean(
+    providerRetryFailureArg(TOOLS[task.providerId] || {})
+    && taskFailureCount(task) > 0
+    && canResumeTask(task)
+  );
+}
+
+function taskOriginView(task) {
+  const origin = String(task?.originView || task?.providerId || '').trim();
+  if (origin && (TOOLS[origin] || PRIMARY_NAV_ITEMS.some((item) => item.id === origin) || origin.startsWith('platform:'))) {
+    return origin;
+  }
+  return 'platform-center';
+}
+
+function taskStatusOrbState(task) {
+  const status = taskDisplayStatus(task);
+  const active = ['running', 'stopping'].includes(status);
+  const current = Math.max(0, Number(task?.progress?.current) || 0);
+  const total = Math.max(0, Number(task?.progress?.total) || 0);
+  if (active && total > 0) return { status: 'running', label: `${Math.min(current, total)}/${total}`, detail: '任务进行中' };
+  if (active) return { status: 'running', label: '处理中', detail: task?.progress?.detail || '任务进行中' };
+  if (status === 'completed') return { status: 'completed', label: '完成', detail: taskSummary(task) };
+  if (status === 'partial' || status === 'paused') return { status: 'partial', label: '部分完成', detail: taskSummary(task) };
+  if (status === 'stopped' || status === 'interrupted') return { status: 'stopped', label: '已停止', detail: taskSummary(task) };
+  return { status: 'failed', label: '失败', detail: taskSummary(task) };
+}
+
+function renderTaskStatusOrb() {
+  const orb = document.getElementById('task-status-orb');
+  if (!orb) return;
+  const task = activeTaskStatusOrbTask();
+  const status = task ? taskDisplayStatus(task) : '';
+  const isActive = ['running', 'stopping'].includes(status);
+  if (!task || (!isActive && dismissedTaskStatusOrbId === task.id)) {
+    orb.hidden = true;
+    orb.replaceChildren();
     return;
   }
-
-  const status = taskDisplayStatus(task);
-  const paths = taskArtifactPaths(task);
-  const failurePreview = taskFailurePreview(task);
-  const failureCount = taskFailureCount(task);
-  const documentFailures = taskDocumentFailureCount(task);
-  const resourceFailures = taskResourceFailureCount(task);
-  const canResume = canResumeTask(task);
-  const resumeReason = resumeTaskDisabledReason(task);
-  const resourceNotice = resourceFailures > 0
-    ? `<p class="task-result-resource-note">资源警告：${resourceFailures} 个图片或附件未完成。${canResume ? '可仅重试失败项。' : '请打开报告处理。'}</p>`
+  const state = taskStatusOrbState(task);
+  const origin = taskOriginView(task);
+  const originName = TOOLS[origin]?.title || PRIMARY_NAV_ITEMS.find((item) => item.id === origin)?.label || '任务页面';
+  const mark = state.status === 'completed' ? '✓' : (state.status === 'partial' || state.status === 'stopped' ? '!' : (state.status === 'failed' ? '×' : '•'));
+  const retryCount = taskFailureCount(task);
+  const retryButton = canRetryFailureItems(task)
+    ? `<button class="task-status-orb-retry" type="button" data-task-orb-action="retry" title="只重新处理这次任务失败的文档或资源">重试失败项${retryCount > 1 ? `（${retryCount}）` : ''}</button>`
     : '';
-  const documentNotice = documentFailures > 0
-    ? `<p class="task-result-document-note">文档失败：${documentFailures} 个。${canResume ? '可仅重试失败文档。' : '请查看报告后重新执行。'}</p>`
-    : '';
-
-  card.className = `task-result-card ${escapeHtml(status)}`;
-  card.hidden = false;
-  card.innerHTML = `
-    <div class="task-result-header">
-      <div>
-        <p class="task-result-kicker">最新任务结果</p>
-        <h3 id="task-result-title">${escapeHtml(task.title || task.providerTitle || '未命名任务')}</h3>
-      </div>
-      <span class="task-status ${escapeHtml(status)}">${escapeHtml(taskHistoryStatusText(task))}</span>
-    </div>
-    <p class="task-result-summary">${escapeHtml(taskSummary(task))}</p>
-    ${documentNotice}
-    ${resourceNotice}
-    ${failurePreview.length ? `
-      <div class="task-result-failures" role="group" aria-labelledby="task-result-failures-title">
-        <strong id="task-result-failures-title">需要处理</strong>
-        <ul>${failurePreview.map((line) => `<li>${escapeHtml(line)}</li>`).join('')}</ul>
-      </div>
-    ` : ''}
-    <div class="task-result-actions" aria-label="最新任务操作">
-      ${canResume ? `<button class="btn-secondary" type="button" data-task-result-action="resume" title="${escapeHtml(resumeReason)}">${escapeHtml(taskResumeActionLabel(task))}</button>` : ''}
-      ${paths.output ? '<button class="btn-text" type="button" data-task-result-action="open-output">打开输出</button>' : ''}
-      ${paths.reportFile ? '<button class="btn-text" type="button" data-task-result-action="open-report">打开报告</button>' : ''}
-      ${failureCount ? '<button class="btn-text" type="button" data-task-result-action="copy-failures" aria-describedby="task-result-failures-title">复制失败项</button>' : ''}
-      <button class="btn-text" type="button" data-task-result-action="copy">复制报告</button>
-      <button class="btn-text" type="button" data-task-result-action="task-center">查看任务中心</button>
-    </div>
+  orb.hidden = false;
+  orb.className = `task-status-orb ${escapeHtml(state.status)}`;
+  orb.innerHTML = `
+    <button class="task-status-orb-main" type="button" data-task-orb-action="return" aria-label="返回任务发起页面：${escapeHtml(originName)}">
+      <span class="task-status-orb-mark" aria-hidden="true">${mark}</span>
+      <span class="task-status-orb-copy"><strong>${escapeHtml(state.label)}</strong><span>${escapeHtml(task.title || task.providerTitle || '最近任务')}</span></span>
+    </button>
+    ${retryButton}
+    <button class="task-status-orb-center" type="button" data-task-orb-action="task-center">任务中心</button>
+    ${isActive ? '' : '<button class="task-status-orb-dismiss" type="button" data-task-orb-action="dismiss" aria-label="隐藏最近任务提示">×</button>'}
   `;
+}
+
+function dismissTaskStatusOrb() {
+  const task = activeTaskStatusOrbTask();
+  if (!task || ['running', 'stopping'].includes(taskDisplayStatus(task))) return;
+  dismissedTaskStatusOrbId = task.id;
+  renderTaskStatusOrb();
+}
+
+function openTaskOrigin(task) {
+  if (!task) return;
+  switchTool(taskOriginView(task));
+}
+
+function taskFailureLogFilename(task) {
+  const source = String(task?.providerTitle || task?.providerId || 'task')
+    .replace(/[\\/:*?"<>|]+/g, '-')
+    .replace(/\s+/g, '-')
+    .replace(/-+/g, '-')
+    .replace(/^-|-$/g, '') || 'task';
+  const date = new Date(task?.finishedAt || task?.startedAt || Date.now());
+  const safeDate = Number.isNaN(date.getTime()) ? new Date() : date;
+  const pad = (value) => String(value).padStart(2, '0');
+  const stamp = `${safeDate.getFullYear()}${pad(safeDate.getMonth() + 1)}${pad(safeDate.getDate())}-${pad(safeDate.getHours())}${pad(safeDate.getMinutes())}${pad(safeDate.getSeconds())}`;
+  return `wandao-失败日志-${source}-${stamp}.log`;
+}
+
+function createTaskFailureLog(task) {
+  const report = normalizedTaskReport(task);
+  const paths = taskArtifactPaths(task);
+  const failures = taskFailureDiagnostics(task, 500);
+  const errorInfo = report.errorInfo || task.errorInfo || null;
+  const taskLogs = Array.isArray(task.logs) ? task.logs : [];
+  const detailLines = taskLogs.map((entry) => formatDeveloperDetailEntry(entry));
+  return maskSensitiveText([
+    '万能导失败日志',
+    `生成时间：${formatUserDateTime(new Date())}`,
+    `任务 ID：${task.id || '-'}`,
+    `平台：${task.providerTitle || task.providerId || '-'}`,
+    `任务：${task.title || '-'}`,
+    `状态：${taskHistoryStatusText(task)}`,
+    `开始时间：${formatUserDateTime(task.startedAt)}`,
+    `结束时间：${formatUserDateTime(task.finishedAt)}`,
+    task.elapsedMs ? `耗时：${formatDuration(task.elapsedMs)}` : '',
+    `统计：${taskSummary(task)}`,
+    paths.output ? `输出目录：${paths.output}` : '',
+    paths.reportFile ? `报告文件：${paths.reportFile}` : '',
+    '',
+    '## 失败项',
+    failures.length ? failures.join('\n') : '脚本未返回逐项失败信息。',
+    '',
+    '## 错误协议',
+    errorInfo ? [
+      `错误代码：${errorInfo.code || '-'}`,
+      `用户提示：${errorInfo.userMessage || '-'}`,
+      `恢复建议：${errorInfo.recovery || '-'}`,
+      `可重试：${errorInfo.retryable ? '是' : '否'}`,
+      errorInfo.correlationId ? `关联 ID：${errorInfo.correlationId}` : ''
+    ].filter(Boolean).join('\n') : (task.error || '无'),
+    '',
+    '## 本任务详细日志',
+    detailLines.length ? detailLines.join('\n') : '无',
+    '',
+    '## 建议',
+    '请将此日志连同任务中心中的截图一并反馈。日志已自动脱敏；如有输出报告，也请一并提供。'
+  ].filter((line) => line !== '').join('\n'));
+}
+
+async function exportTaskFailureLog(taskId) {
+  const task = taskHistory.find((item) => item.id === taskId);
+  if (!task || !taskNeedsFailureLog(task)) {
+    notifyUser('这条任务没有可导出的失败日志。', 'info');
+    return;
+  }
+  const target = await window.electronAPI.saveFile({
+    title: '导出失败日志',
+    defaultPath: taskFailureLogFilename(task),
+    filters: [{ name: '日志文件', extensions: ['log'] }, { name: '文本文件', extensions: ['txt'] }]
+  });
+  if (!target) return;
+  const result = await window.electronAPI.writeFile(target, createTaskFailureLog(task));
+  if (!result?.success) throw new Error(result?.error || '写入失败日志失败');
+  log('已导出失败日志。', 'success');
 }
 
 async function handleTaskAction(task, action) {
   if (!task && action !== 'task-center') return;
   if (action === 'copy') return copyTaskReport(task.id);
   if (action === 'copy-failures') return copyTaskFailures(task.id);
+  if (action === 'export-failure-log') return exportTaskFailureLog(task.id);
   if (action === 'open-report') return openTaskArtifact(task, 'report');
   if (action === 'open-output') return openTaskArtifact(task, 'output');
   if (action === 'resume') return resumeTask(task);
@@ -1584,17 +1951,21 @@ function startHistoryTask(script, args, context = {}) {
     elapsedMs: 0,
     resultData: null,
     error: '',
+    errorInfo: null,
     stats: extractTaskStats(null),
+    originView: context.originView || currentTool,
+    progress: { current: 0, total: 0, detail: '' },
     logs: []
   };
   taskHistory.unshift(task);
   taskHistory = taskHistory.slice(0, MAX_TASK_HISTORY);
   activeHistoryTask = task;
   latestFinishedTaskId = '';
+  dismissedTaskStatusOrbId = '';
   activeTaskLogEntries = [];
   task.pendingSave = saveTaskHistory();
   renderTaskHistory();
-  renderTaskResultCard();
+  renderTaskStatusOrb();
   return task;
 }
 
@@ -1615,9 +1986,16 @@ async function finishHistoryTask(task, result, thrownError = null) {
   task.finishedAt = finishedAt.toISOString();
   task.elapsedMs = finishedAt.getTime() - startedAt.getTime();
   task.resultData = result?.data || null;
-  task.error = thrownError ? formatError(thrownError) : (result?.error || '');
+  const rawTaskErrorInfo = result?.errorInfo || result?.data?.errorInfo || thrownError || result?.error || '';
+  task.errorInfo = rawTaskErrorInfo
+    ? normalizeErrorInfo(rawTaskErrorInfo, { provider: task.providerId, operation: task.action })
+    : null;
+  task.error = thrownError
+    ? formatError(thrownError)
+    : (result?.error || task.errorInfo?.technicalMessage || '');
   task.report = window.WandaoTaskReport?.normalizeTaskReport(task.resultData, {
     errorText: task.error,
+    errorInfo: result?.errorInfo || result?.data?.errorInfo || task.errorInfo,
     provider: task.providerId,
     mode: task.action
   }) || null;
@@ -1630,7 +2008,8 @@ async function finishHistoryTask(task, result, thrownError = null) {
     status: fallbackStatus,
     result,
     thrownError,
-    errorText: task.error
+    errorText: task.error,
+    errorInfo: task.errorInfo
   }) || fallbackStatus;
   task.logs = [...activeTaskLogEntries];
   if (activeHistoryTask?.id === task.id) {
@@ -1640,9 +2019,8 @@ async function finishHistoryTask(task, result, thrownError = null) {
   latestFinishedTaskId = task.id;
   await saveTaskHistory();
   renderTaskHistory();
-  renderTaskResultCard(task);
+  renderTaskStatusOrb();
   announceTaskOutcome(task);
-  focusTaskResultCard();
 }
 
 async function runTrackedPythonCommand(script, args, context = {}, options = {}) {
@@ -1696,7 +2074,8 @@ async function runTrackedPythonCommand(script, args, context = {}, options = {})
         stopped: isStoppedResult(result),
         code: result?.code ?? 0,
         legacyResult: Boolean(result?.legacyResult),
-        error: result?.error ? compactDiagnostic(result.error, 1600) : ''
+        error: result?.error ? compactDiagnostic(result.error, 1600) : '',
+        errorInfo: result?.errorInfo || result?.data?.errorInfo || null
       }
     });
     await finishHistoryTask(task, result);
@@ -1709,6 +2088,7 @@ async function runTrackedPythonCommand(script, args, context = {}, options = {})
         ...runtimeContext,
         elapsedMs: Date.now() - runtimeStartedAt,
         error: formatError(error),
+        errorInfo: normalizeErrorInfo(error, { provider: providerId, operation: context.action }),
         stack: error?.stack || ''
       }
     });
@@ -1721,6 +2101,12 @@ async function runProviderCommand(script, args, context = {}, options = {}) {
   const providerId = context.providerId || currentTool;
   if (isRunning || activeCommandOwner) {
     throw new Error('当前已有任务运行中，请等待结束或先停止当前任务。');
+  }
+  if (!progressVisible) {
+    startProgress(
+      context.title || TOOLS[providerId]?.title || '任务进行中',
+      context.progressDetail || '任务启动中，正在等待进度信息...'
+    );
   }
   if (!context.parentRunId && currentTool === providerId) {
     recordCurrentRecentInputs(providerId);
@@ -1752,11 +2138,11 @@ function shouldTrackManifestAction(action) {
 async function resumeTask(task) {
   if (!task) return;
   if (isRunning) {
-    alert('当前已有任务运行中，请等待结束或先停止当前任务。');
+    notifyUser('当前已有任务运行中，请等待结束或先停止当前任务。', 'warn');
     return;
   }
   if (!task.script || !Array.isArray(task.args)) {
-    alert('这条任务缺少可继续执行的命令参数。');
+    notifyUser('这条任务缺少可继续执行的命令参数。', 'warn');
     return;
   }
   const args = resumeTaskArgs(task);
@@ -1773,39 +2159,38 @@ async function resumeTask(task) {
       && retryableFailures > 0
       && args.includes(retryArg)
     );
+  const resumeSubject = taskResumeSubject(task);
   const confirmDetail = retryingFailures
     ? `将只重试上次报告中的失败项，共 ${retryableFailures} 个。`
     : '将按历史命令重新执行，适合增量任务或中断后继续。';
-  if (!confirm(`继续任务：${task.title || task.script}\n${confirmDetail}\n\n确认继续吗？`)) {
+  if (!(await confirmUserAction(`继续任务：${resumeSubject}\n${confirmDetail}\n\n确认继续吗？`, {
+    title: retryingFailures ? '确认重试失败项' : '确认继续任务',
+    confirmLabel: retryingFailures ? '开始重试' : '继续任务'
+  }))) {
     return;
   }
   if (task.providerId && TOOLS[task.providerId] && currentTool !== task.providerId) {
     if (!switchTool(task.providerId)) {
-      alert('暂时无法打开这条任务对应的平台页面，请稍后重试。');
+      notifyUser('暂时无法打开这条任务对应的平台页面，请稍后重试。', 'warn');
       return;
     }
   }
-  startProgress(`继续任务：${task.title || task.script}`, retryingFailures ? '正在读取上次报告并重试失败项...' : '正在按历史命令重新执行，脚本会根据自身增量能力跳过已完成内容。');
-  log(retryingFailures ? `重试失败项：${task.title || task.script}` : `继续任务：${task.title || task.script}`, 'info');
+  startProgress(`继续任务：${resumeSubject}`, retryingFailures ? '正在读取上次报告并重试失败项...' : '正在按历史命令重新执行，脚本会根据自身增量能力跳过已完成内容。');
+  log(retryingFailures ? `重试失败项：${resumeSubject}` : `继续任务：${resumeSubject}`, 'info');
   try {
     const result = await runProviderCommand(task.script, args, {
       providerId: task.providerId || currentTool,
-      title: retryingFailures ? `重试失败项：${task.title || task.script}` : `继续任务：${task.title || task.script}`,
+      title: retryingFailures ? `重试失败项：${resumeSubject}` : `继续任务：${resumeSubject}`,
       action: retryingFailures ? '重试失败项' : (task.action || '继续'),
       jobId: task.jobId || task.id,
       parentRunId: task.runId || task.id
     });
     const outcome = taskResultStatus(result, { provider: task.providerId, mode: task.action });
     if ((outcome === 'completed' || outcome === 'partial' || outcome === 'paused') && !isStoppedResult(result)) {
-      if (outcome === 'paused') {
-        log('历史任务因频率限制安全暂停，可稍后继续。', 'warn');
-        finishProgressForTaskResult(result, '历史任务继续执行', { provider: task.providerId, mode: task.action });
-        return;
-      }
-      log(outcome === 'partial' ? '历史任务继续执行部分完成，请查看失败项' : '历史任务继续执行完成', outcome === 'partial' ? 'warn' : 'success');
       appendExportSuccessSponsorLogs(outcome, task.action);
-      if (result.data) log(JSON.stringify(result.data, null, 2), 'success');
+      if (result.data) log(JSON.stringify(result.data, null, 2), 'info');
       finishProgressForTaskResult(result, '历史任务继续执行完成', { provider: task.providerId, mode: task.action });
+      logTaskResultCompletion(result, '历史任务继续执行完成', { provider: task.providerId, mode: task.action });
     } else if (outcome === 'stopped') {
       log('历史任务继续执行已停止，已完成项目会在下次继续时跳过。', 'warn');
       finishProgress('stopped', '历史任务继续执行已停止');
@@ -1834,14 +2219,69 @@ function progressElements() {
     percent: document.getElementById('progress-percent'),
     fill: document.getElementById('progress-fill'),
     detail: document.getElementById('progress-detail'),
+    elapsed: document.getElementById('progress-elapsed'),
     track: document.querySelector('#progress-section .progress-track')
   };
 }
 
-function startProgress(title, detail = '任务启动中，正在等待进度信息...') {
+function formatProgressElapsed(ms) {
+  const seconds = Math.max(0, Math.floor((Number(ms) || 0) / 1000));
+  if (seconds < 60) return `已用时 ${seconds} 秒`;
+  const minutes = Math.floor(seconds / 60);
+  const remainder = seconds % 60;
+  return remainder ? `已用时 ${minutes} 分 ${remainder} 秒` : `已用时 ${minutes} 分`;
+}
+
+function inferProgressPhase(title, detail, explicitPhase = '') {
+  if (explicitPhase) return String(explicitPhase);
+  const text = `${title || ''} ${detail || ''}`;
+  if (/(读取|扫描|加载).*目录|目录.*(读取|扫描|加载)/.test(text)) return 'directory';
+  if (/(登录|凭证|cookie|授权)/i.test(text)) return 'auth';
+  if (/(导入|导出|上传|下载)/.test(text)) return 'transfer';
+  return 'task';
+}
+
+function progressHeartbeatDetail(elapsedMs) {
+  const elapsed = formatProgressElapsed(elapsedMs);
+  const base = progressBaseDetail || '任务正在处理中';
+  const seconds = Math.max(0, Math.floor((Number(elapsedMs) || 0) / 1000));
+  if (progressPhase === 'directory') {
+    if (seconds < 5) return `${base}（${elapsed}）`;
+    if (/已发现\s*\d+\s*个节点/.test(base)) return `${base}（${elapsed}，仍在整理目录结构）`;
+    if (seconds < 15) return `正在连接远端服务并读取目录结构（${elapsed}）`;
+    return `仍在读取远端目录，远端暂未返回细分进度（${elapsed}）`;
+  }
+  if (seconds < 8) return `${base}（${elapsed}）`;
+  if (seconds < 20) return `${base}（${elapsed}，任务仍在进行）`;
+  return `${base}（${elapsed}，任务仍在进行，请稍候）`;
+}
+
+function refreshProgressFeedback({ refreshDetail = true } = {}) {
+  if (!progressVisible || !progressStartedAt) return;
+  const els = progressElements();
+  const elapsedMs = Date.now() - progressStartedAt;
+  if (els.elapsed) els.elapsed.textContent = formatProgressElapsed(elapsedMs);
+  if (refreshDetail && !progressHasRealProgress && els.detail) {
+    els.detail.textContent = progressHeartbeatDetail(elapsedMs);
+  }
+}
+
+function stopProgressHeartbeat() {
+  if (progressHeartbeatTimer) {
+    window.clearInterval(progressHeartbeatTimer);
+    progressHeartbeatTimer = null;
+  }
+}
+
+function startProgress(title, detail = '任务启动中，正在等待进度信息...', options = {}) {
   const els = progressElements();
   if (!els.section) return;
+  stopProgressHeartbeat();
   progressVisible = true;
+  progressStartedAt = Date.now();
+  progressBaseDetail = detail || '任务正在处理中';
+  progressPhase = inferProgressPhase(title, detail, options.phase);
+  progressHasRealProgress = false;
   pythonProgressBuffer = '';
   pythonLogSummaryBuffer = '';
   els.section.hidden = false;
@@ -1850,9 +2290,15 @@ function startProgress(title, detail = '任务启动中，正在等待进度信�
   els.percent.textContent = '进行中';
   els.fill.className = 'progress-fill indeterminate';
   els.fill.style.width = '';
-  els.detail.textContent = detail;
+  els.detail.textContent = progressBaseDetail;
+  if (els.elapsed) els.elapsed.textContent = '已用时 0 秒';
   els.track?.removeAttribute('aria-valuenow');
   els.track?.removeAttribute('aria-valuetext');
+  progressHeartbeatTimer = window.setInterval(() => refreshProgressFeedback(), 1000);
+  if (activeHistoryTask) {
+    activeHistoryTask.progress = { current: 0, total: 0, detail: progressBaseDetail };
+    renderTaskStatusOrb();
+  }
   setLogCollapsed(false);
 }
 
@@ -1862,6 +2308,8 @@ function updateProgress(done, total, detail = '') {
   const safeTotal = Math.max(0, Number(total) || 0);
   const safeDone = Math.max(0, Number(done) || 0);
   if (!progressVisible) startProgress('任务进行中');
+  if (detail) progressBaseDetail = detail;
+  progressHasRealProgress = safeTotal > 0;
   if (!safeTotal) {
     els.percent.textContent = '进行中';
     els.fill.className = 'progress-fill indeterminate';
@@ -1869,6 +2317,11 @@ function updateProgress(done, total, detail = '') {
     els.track?.removeAttribute('aria-valuenow');
     els.track?.setAttribute('aria-valuetext', detail || '任务进行中');
     if (detail) els.detail.textContent = detail;
+    if (activeHistoryTask) {
+      activeHistoryTask.progress = { current: safeDone, total: 0, detail: detail || progressBaseDetail || '任务进行中' };
+      renderTaskStatusOrb();
+    }
+    refreshProgressFeedback({ refreshDetail: false });
     return;
   }
   const ratio = Math.min(1, safeDone / safeTotal);
@@ -1880,10 +2333,17 @@ function updateProgress(done, total, detail = '') {
   const progressDetail = detail || `已处理 ${safeDone}/${safeTotal}`;
   els.track?.setAttribute('aria-valuetext', progressDetail);
   els.detail.textContent = progressDetail;
+  if (activeHistoryTask) {
+    activeHistoryTask.progress = { current: safeDone, total: safeTotal, detail: progressDetail };
+    renderTaskStatusOrb();
+  }
+  refreshProgressFeedback({ refreshDetail: false });
 }
 
 function finishProgress(outcome, detail) {
   const els = progressElements();
+  const elapsedMs = progressStartedAt ? Date.now() - progressStartedAt : 0;
+  stopProgressHeartbeat();
   if (!els.section) return;
   if (!progressVisible) {
     els.section.hidden = false;
@@ -1898,6 +2358,10 @@ function finishProgress(outcome, detail) {
     failed: { label: '失败', className: 'error', ariaValue: '', fallback: '任务失败，请查看运行日志' }
   }[status] || { label: '失败', className: 'error', ariaValue: '', fallback: '任务失败，请查看运行日志' };
   progressVisible = false;
+  progressStartedAt = 0;
+  progressBaseDetail = '';
+  progressPhase = 'task';
+  progressHasRealProgress = false;
   els.section.setAttribute('aria-busy', 'false');
   els.percent.textContent = config.label;
   els.fill.className = 'progress-fill ' + config.className;
@@ -1906,6 +2370,11 @@ function finishProgress(outcome, detail) {
   else els.track?.removeAttribute('aria-valuenow');
   els.track?.setAttribute('aria-valuetext', detail || config.fallback);
   els.detail.textContent = detail || config.fallback;
+  if (els.elapsed) els.elapsed.textContent = elapsedMs ? formatProgressElapsed(elapsedMs) : '已用时 0 秒';
+  window.setTimeout(() => {
+    if (!progressVisible) els.section.hidden = true;
+  }, 260);
+  renderTaskStatusOrb();
 }
 
 function keyValuesFromProgress(text) {
@@ -2115,9 +2584,13 @@ function renderProviderSafetyNotice(provider) {
   `;
 }
 
-function confirmProviderExecution(provider, action = null) {
+async function confirmProviderExecution(provider, action = null) {
   if (!window.WandaoProviderRuntime?.shouldConfirmExecution(provider, action)) return true;
-  return confirm(window.WandaoProviderRuntime.executionConfirmMessage(provider));
+  return confirmUserAction(window.WandaoProviderRuntime.executionConfirmMessage(provider), {
+    title: '确认运行本地插件脚本',
+    confirmLabel: '运行脚本',
+    danger: true
+  });
 }
 
 function allProviders() {
@@ -2280,7 +2753,6 @@ function renderProviderNavigation() {
   const sidebar = document.getElementById('provider-sidebar') || document.querySelector('.sidebar');
   if (!sidebar) return;
   const activeId = primaryNavIdFor();
-  const navigationLocked = isRunning;
   sidebar.innerHTML = `
     <div class="sidebar-intro">
       <span>知识迁移</span>
@@ -2289,7 +2761,7 @@ function renderProviderNavigation() {
     <nav class="nav-group" aria-label="工作台">
       <span class="nav-group-label">工作台</span>
       ${PRIMARY_NAV_ITEMS.map((item) => `
-        <button class="nav-item ${item.id === activeId ? 'active' : ''}" data-tool="${escapeHtml(item.id)}" type="button" ${item.id === activeId ? 'aria-current="page"' : ''} ${navigationLocked ? 'disabled aria-disabled="true" title="任务运行中，请等待任务结束或先停止任务"' : ''}>
+        <button class="nav-item ${item.id === activeId ? 'active' : ''}" data-tool="${escapeHtml(item.id)}" type="button" ${item.id === activeId ? 'aria-current="page"' : ''}>
           ${navigationIcon(item.icon)}
           <span class="nav-copy">
             <strong>${escapeHtml(item.label)}</strong>
@@ -2305,9 +2777,7 @@ function renderProviderNavigation() {
 function bindWorkbenchActions(root = document.getElementById('content-area')) {
   if (!root) return;
   root.querySelectorAll('[data-switch-view]').forEach((button) => {
-    button.addEventListener('click', () => {
-      if (!isRunning) switchTool(button.dataset.switchView);
-    });
+    button.addEventListener('click', () => switchTool(button.dataset.switchView));
   });
   root.querySelectorAll('[data-platform-key]').forEach((button) => {
     button.addEventListener('click', () => {
@@ -2859,7 +3329,7 @@ async function detectAvailableBrowsers(options = {}) {
 
 async function saveBrowserSetting(browserPath) {
   if (!window.electronAPI.saveAppSettings) {
-    alert('当前版本暂不支持保存浏览器设置。');
+    notifyUser('当前版本暂不支持保存浏览器设置。', 'warn');
     return;
   }
   const button = document.getElementById('settings-browser-save');
@@ -2878,7 +3348,7 @@ async function saveBrowserSetting(browserPath) {
     log(browserPath ? `已保存自动化浏览器：${browserNameFromPath(browserPath)}` : '已恢复为自动检测浏览器。', 'success');
   } catch (error) {
     log(`保存浏览器设置失败：${formatError(error)}`, 'error');
-    alert(`保存失败：${formatError(error)}`);
+    notifyError(error, { title: '保存浏览器设置失败' });
   } finally {
     if (button) {
       button.disabled = false;
@@ -2896,7 +3366,7 @@ async function chooseBrowserFile() {
     if (!result.success) {
       const message = result.error || '没有选择可用浏览器。';
       log(message, 'error');
-      alert(message);
+      notifyError(new Error(message), { title: '浏览器选择失败' });
       return;
     }
     browserPath = result.path || '';
@@ -2969,6 +3439,12 @@ function renderSettingsPage() {
       </article>
       <article class="settings-card settings-card-compact">
         <span class="card-eyebrow">帮助</span>
+        <h4>快速教程</h4>
+        <p>了解登录、导入、导出和图片处理方式。</p>
+        <button class="btn-secondary" data-settings-action="tutorial" type="button">查看快速教程</button>
+      </article>
+      <article class="settings-card settings-card-compact">
+        <span class="card-eyebrow">帮助</span>
         <h4>关于</h4>
         <p>查看版本、项目地址和许可证。</p>
         <button class="btn-secondary" data-settings-action="about" type="button">关于万能导</button>
@@ -3001,6 +3477,9 @@ function renderSettingsPage() {
     const summary = contentArea.querySelector('[data-settings-log-mode-summary]');
     if (summary) summary.textContent = `当前显示：${logViewMode === 'detail' ? '详细日志' : '用户日志'}`;
   });
+  contentArea.querySelector('[data-settings-action="tutorial"]')?.addEventListener('click', () => {
+    switchTool('notice-center');
+  });
   contentArea.querySelector('[data-settings-action="about"]')?.addEventListener('click', () => {
     window.electronAPI.showAbout();
   });
@@ -3011,13 +3490,13 @@ function renderTaskCenterPage() {
   const contentArea = document.getElementById('content-area');
   const resumableCount = taskHistory.filter(canResumeTask).length;
   contentArea.innerHTML = `
-    <section class="task-center-hero">
-      <div>
-        <p class="view-kicker">任务记录</p>
-        <h3>${taskHistory.length ? `已记录 ${taskHistory.length} 个任务` : '还没有任务记录'}</h3>
-        <p>${resumableCount ? `${resumableCount} 个任务可以继续或重试。` : '开始一次导入或导出后，进度和报告会显示在这里。'}</p>
+    <section class="task-center-summary" aria-label="任务概览">
+      <div class="task-center-summary-copy">
+        <span class="view-kicker">任务记录</span>
+        <strong>${taskHistory.length}</strong><span>条任务</span>
+        <small>${resumableCount ? `${resumableCount} 条可继续或重试` : '任务记录保存在本机'}</small>
       </div>
-      <button class="btn-primary" data-switch-view="platform-center" type="button">开始新任务</button>
+      <button class="btn-secondary" data-switch-view="platform-center" type="button">开始新任务</button>
     </section>
   `;
   setTaskHistoryVisible(true);
@@ -3337,14 +3816,27 @@ function pluginProgressHtml(pluginId) {
   const details = pluginProgressDetails(pluginOperationState.get(pluginId));
   if (!details) return '';
   return `<div class="plugin-download-progress" data-plugin-progress="${escapeHtml(pluginId)}" role="status" aria-live="polite">
-    <div class="plugin-download-progress-track"><span class="${details.indeterminate ? 'is-indeterminate' : ''}" style="width:${details.indeterminate ? 100 : details.percent}%"></span></div>
+    <div class="plugin-download-progress-track"><span class="${details.indeterminate ? 'is-indeterminate' : ''}" data-progress-percent="${details.indeterminate ? 42 : details.percent}"></span></div>
     <span>${escapeHtml(details.text)}</span>
   </div>`;
+}
+
+function applyPluginProgressStyle(element) {
+  if (!element) return;
+  const indicator = element.querySelector('.plugin-download-progress-track span');
+  const details = pluginProgressDetails(pluginOperationState.get(element.dataset.pluginProgress));
+  if (!indicator || !details) return;
+  indicator.style.setProperty('--plugin-progress-width', `${details.indeterminate ? 42 : details.percent}%`);
+}
+
+function hydratePluginProgressUi(root = document) {
+  root.querySelectorAll?.('[data-plugin-progress]').forEach(applyPluginProgressStyle);
 }
 
 function refreshPluginProgressUi(pluginId) {
   document.querySelectorAll(`[data-plugin-progress="${pluginId}"]`).forEach((element) => {
     element.outerHTML = pluginProgressHtml(pluginId);
+    applyPluginProgressStyle(document.querySelector(`[data-plugin-progress="${pluginId}"]`));
   });
 }
 
@@ -3354,21 +3846,52 @@ function pluginUpdateCandidates() {
   return pluginCatalogState.plugins.filter((plugin) => plugin.updateAvailable && plugin.compatibility?.compatible !== false);
 }
 
+function runningTaskProviderId() {
+  return String(activeHistoryTask?.providerId || mainPythonProcessState.providerId || '').trim();
+}
+
+function runningTaskPluginId() {
+  const providerId = runningTaskProviderId();
+  return String(TOOLS[providerId]?.pluginId || '').trim();
+}
+
+function pluginOperationBlocked(pluginId) {
+  const runningPluginId = runningTaskPluginId();
+  return Boolean(
+    (isRunning || mainPythonProcessState.running)
+    && runningPluginId
+    && String(pluginId || '').trim() === runningPluginId
+  );
+}
+
+function pluginOperationBlockedTitle(pluginId) {
+  const providerId = runningTaskProviderId();
+  const providerTitle = TOOLS[providerId]?.title || providerId || '当前平台';
+  return `当前正在使用“${providerTitle}”插件，任务结束后才能操作。`;
+}
+
+function pluginOperationAttributes(pluginId) {
+  return pluginOperationBlocked(pluginId)
+    ? `disabled aria-disabled="true" title="${escapeHtml(pluginOperationBlockedTitle(pluginId))}"`
+    : '';
+}
+
 function renderPluginCard(plugin) {
   const permissionTags = pluginPermissionTags(plugin);
   const compatible = plugin.compatibility?.compatible !== false;
   const operationRunning = pluginOperationState.has(plugin.id);
+  const operationAttributes = pluginOperationAttributes(plugin.id);
   const primary = operationRunning
     ? `<button class="btn-primary" type="button" disabled>${plugin.installed ? '正在更新…' : '正在安装…'}</button>`
     : plugin.bundled && !plugin.installed && !plugin.updateAvailable
     ? '<span class="plugin-status">已随主程序提供</span>'
     : plugin.bundled && !plugin.installed
-      ? `<button class="btn-primary" data-plugin-action="install" data-plugin-id="${escapeHtml(plugin.id)}" type="button" ${compatible ? '' : 'disabled'}>安装更新</button>`
+      ? `<button class="btn-primary" data-plugin-action="install" data-plugin-id="${escapeHtml(plugin.id)}" type="button" ${compatible ? operationAttributes : 'disabled aria-disabled="true"'}>安装更新</button>`
       : !plugin.installed
-    ? `<button class="btn-primary" data-plugin-action="install" data-plugin-id="${escapeHtml(plugin.id)}" type="button" ${compatible ? '' : 'disabled'}>安装</button>`
+    ? `<button class="btn-primary" data-plugin-action="install" data-plugin-id="${escapeHtml(plugin.id)}" type="button" ${compatible ? operationAttributes : 'disabled aria-disabled="true"'}>安装</button>`
     : (plugin.updateAvailable
-      ? `<button class="btn-primary" data-plugin-action="install" data-plugin-id="${escapeHtml(plugin.id)}" type="button">更新</button>`
-      : `<button class="btn-secondary" data-plugin-action="toggle" data-plugin-id="${escapeHtml(plugin.id)}" data-enabled="${plugin.enabled ? 'false' : 'true'}" type="button">${plugin.enabled ? '停用' : '启用'}</button>`);
+      ? `<button class="btn-primary" data-plugin-action="install" data-plugin-id="${escapeHtml(plugin.id)}" type="button" ${compatible ? operationAttributes : 'disabled aria-disabled="true"'}>更新</button>`
+      : `<button class="btn-secondary" data-plugin-action="toggle" data-plugin-id="${escapeHtml(plugin.id)}" data-enabled="${plugin.enabled ? 'false' : 'true'}" type="button" ${operationAttributes}>${plugin.enabled ? '停用' : '启用'}</button>`);
   return `
     <article class="plugin-card ${plugin.installed ? 'installed' : ''}">
       <div class="plugin-card-heading">
@@ -3386,8 +3909,8 @@ function renderPluginCard(plugin) {
       ${pluginProgressHtml(plugin.id)}
       <div class="plugin-card-actions">
         ${primary}
-        ${plugin.installed && (plugin.previousVersions || []).length ? `<button class="btn-text" data-plugin-action="rollback" data-plugin-id="${escapeHtml(plugin.id)}" type="button">回滚</button>` : ''}
-        ${plugin.installed ? `<button class="btn-text danger-text" data-plugin-action="uninstall" data-plugin-id="${escapeHtml(plugin.id)}" type="button">卸载</button>` : ''}
+        ${plugin.installed && (plugin.previousVersions || []).length ? `<button class="btn-text" data-plugin-action="rollback" data-plugin-id="${escapeHtml(plugin.id)}" type="button" ${operationAttributes}>回滚</button>` : ''}
+        ${plugin.installed ? `<button class="btn-text danger-text" data-plugin-action="uninstall" data-plugin-id="${escapeHtml(plugin.id)}" type="button" ${operationAttributes}>卸载</button>` : ''}
       </div>
     </article>
   `;
@@ -3432,6 +3955,16 @@ async function loadPluginCatalog(refresh = false) {
   }
 }
 
+async function refreshPluginCatalogFromUi() {
+  const result = await loadPluginCatalog(true);
+  if (result?.success) {
+    notifyUser(result.offline ? '已读取本机插件状态；在线插件库暂不可用。' : '插件库已刷新。', result.offline ? 'warn' : 'success');
+  } else if (!result?.stale) {
+    notifyError(new Error(result?.error || '刷新插件库失败'), { title: '刷新插件库失败' });
+  }
+  return result;
+}
+
 function renderPluginCatalogViews() {
   if (currentTool === 'plugin-center') renderPluginCenterPage();
   if (currentTool === 'platform-center') renderPlatformCenterPage();
@@ -3443,6 +3976,10 @@ async function refreshProvidersAfterPluginChange() {
 }
 
 async function installPluginFromCatalog(plugin) {
+  if (!plugin?.id) throw new Error('插件信息不完整，无法执行安装或更新。');
+  if (pluginOperationBlocked(plugin.id)) {
+    throw new Error(pluginOperationBlockedTitle(plugin.id));
+  }
   pluginOperationState.set(plugin.id, { phase: 'preparing', receivedBytes: 0, totalBytes: 0 });
   renderPluginCatalogViews();
   try {
@@ -3460,7 +3997,11 @@ async function installPluginFromCatalog(plugin) {
 async function runPlatformPluginUpdate(groupKey, button) {
   const group = findPlatformGroup(groupKey);
   if (!group) return;
-  const candidates = platformPluginUpdateCandidates(group);
+  const allCandidates = platformPluginUpdateCandidates(group);
+  const candidates = allCandidates.filter((plugin) => !pluginOperationBlocked(plugin.id));
+  if (allCandidates.length !== candidates.length) {
+    log(`当前任务正在使用 ${allCandidates.length - candidates.length} 个待更新插件，已跳过。`, 'warn');
+  }
   if (!candidates.length) {
     await loadPluginCatalog(true);
     return;
@@ -3485,13 +4026,22 @@ async function runPlatformPluginUpdate(groupKey, button) {
     if (updatedCount) await refreshProvidersAfterPluginChange();
     await loadPluginCatalog(true);
     if (failures.length) {
-      alert(`“${group.name}”插件更新完成，但 ${failures.length} 个失败：\n${failures.join('\n')}`);
+      pluginOperationNotice = {
+        type: 'warning',
+        title: `${group.name} 更新部分完成`,
+        message: failures.join('\n')
+      };
+      notifyUser(`“${group.name}”插件更新完成，但 ${failures.length} 个失败：\n${failures.join('\n')}`, 'warn', {
+        title: '部分插件更新失败',
+        duration: 0
+      });
     } else if (updatedCount) {
+      pluginOperationNotice = null;
       log(`“${group.name}”的插件已更新`, 'success');
     }
   } catch (error) {
     log(`插件更新失败：${formatError(error)}`, 'error');
-    alert(formatError(error));
+    notifyError(error, { title: '插件更新失败' });
   } finally {
     button.disabled = false;
     button.textContent = originalButtonText;
@@ -3500,6 +4050,10 @@ async function runPlatformPluginUpdate(groupKey, button) {
 }
 
 async function runPluginCenterAction(action, pluginId, button) {
+  if (pluginOperationBlocked(pluginId)) {
+    notifyUser(pluginOperationBlockedTitle(pluginId), 'warn');
+    return;
+  }
   button.disabled = true;
   const originalButtonText = button.textContent;
   if (action === 'uninstall') button.textContent = '卸载中…';
@@ -3509,16 +4063,31 @@ async function runPluginCenterAction(action, pluginId, button) {
     if (action === 'install') {
       const permissions = pluginPermissionTags(plugin || {});
       const detail = permissions.length ? `\n\n将授予：${permissions.join('、')}` : '';
-      if (!confirm(`${plugin?.installed ? '更新' : '安装'}插件“${plugin?.name || pluginId}”？${detail}`)) return;
+      if (!(await confirmUserAction(`${plugin?.installed ? '更新' : '安装'}插件“${plugin?.name || pluginId}”？${detail}`, {
+        title: plugin?.installed ? '确认更新插件' : '确认安装插件',
+        confirmLabel: plugin?.installed ? '更新插件' : '安装插件'
+      }))) return;
       result = await installPluginFromCatalog(plugin);
     } else if (action === 'toggle') {
       result = await window.electronAPI.setPluginEnabled(pluginId, button.dataset.enabled === 'true');
     } else if (action === 'rollback') {
-      if (!confirm('回滚到上一个已安装版本？当前版本会保留，可再次切换。')) return;
+      if (!(await confirmUserAction('回滚到上一个已安装版本？当前版本会保留，可再次切换。', {
+        title: '确认回滚插件',
+        confirmLabel: '回滚'
+      }))) return;
       result = await window.electronAPI.rollbackPlugin(pluginId);
     } else if (action === 'uninstall') {
-      if (!confirm(`卸载插件“${plugin?.name || pluginId}”？插件生成的导出文件不会删除。`)) return;
-      const clearData = confirm('是否同时删除这个插件保存的登录凭证、配置和缓存？\n\n选择“取消”只删除插件本体，保留以后可能需要的配置。');
+      if (!(await confirmUserAction(`卸载插件“${plugin?.name || pluginId}”？插件生成的导出文件不会删除。`, {
+        title: '确认卸载插件',
+        confirmLabel: '卸载插件',
+        danger: true
+      }))) return;
+      const clearData = await confirmUserAction('是否同时删除这个插件保存的登录凭证、配置和缓存？\n\n选择“仅卸载插件”会保留以后可能需要的配置；导出文件始终不会删除。', {
+        title: '是否删除插件数据？',
+        confirmLabel: '删除插件数据',
+        cancelLabel: '仅卸载插件',
+        danger: true
+      });
       result = await window.electronAPI.uninstallPlugin(pluginId, clearData);
     }
     if (!result?.success) throw new Error(result?.error || '插件操作失败');
@@ -3527,14 +4096,19 @@ async function runPluginCenterAction(action, pluginId, button) {
     }
     if (result.warning) {
       log(`插件操作提醒：${result.warning}`, 'warn');
-      alert(result.warning);
+      notifyUser(result.warning, 'warn', { title: '插件操作提醒', duration: 0 });
     }
-    log(`插件操作完成：${plugin?.name || pluginId}`, 'success');
+    const operationLabel = action === 'uninstall'
+      ? (result.dataRemoved ? '插件及其本地配置已卸载' : '插件本体已卸载，配置和缓存已保留')
+      : (action === 'rollback' ? '插件已回滚' : action === 'toggle' ? (button.dataset.enabled === 'true' ? '插件已启用' : '插件已停用') : '插件已安装/更新');
+    log(`插件操作完成：${plugin?.name || pluginId}（${operationLabel}）`, 'success');
+    notifyUser(`${plugin?.name || pluginId}：${operationLabel}。导出文件不会被删除。`, 'success');
+    pluginOperationNotice = null;
     await refreshProvidersAfterPluginChange();
     await loadPluginCatalog(action === 'uninstall' ? false : true);
   } catch (error) {
     log(`插件操作失败：${formatError(error)}`, 'error');
-    alert(formatError(error));
+    notifyError(error, { title: '插件操作失败' });
   } finally {
     button.disabled = false;
     button.textContent = originalButtonText;
@@ -3542,9 +4116,17 @@ async function runPluginCenterAction(action, pluginId, button) {
 }
 
 async function runPluginCenterUpdateAll(button) {
-  const candidates = pluginUpdateCandidates();
+  const allCandidates = pluginUpdateCandidates();
+  const candidates = allCandidates.filter((plugin) => !pluginOperationBlocked(plugin.id));
+  const blockedCount = allCandidates.length - candidates.length;
   if (!candidates.length) return;
-  if (!confirm(`更新全部 ${candidates.length} 个可更新插件？将逐个下载、校验并安装，已安装的插件数据不会删除。`)) return;
+  if (blockedCount) {
+    log(`当前任务正在使用 ${blockedCount} 个待更新插件，批量更新将跳过它们。`, 'warn');
+  }
+  if (!(await confirmUserAction(`更新全部 ${candidates.length} 个可更新插件？将逐个下载、校验并安装，已安装的插件数据不会删除。`, {
+    title: '确认批量更新插件',
+    confirmLabel: '全部更新'
+  }))) return;
   pluginBulkUpdateRunning = true;
   button.disabled = true;
   if (currentTool === 'plugin-center') renderPluginCenterPage();
@@ -3562,10 +4144,22 @@ async function runPluginCenterUpdateAll(button) {
     await refreshProvidersAfterPluginChange();
     await loadPluginCatalog(true);
     if (failed.length) {
-      alert(`已完成批量更新，但 ${failed.length} 个插件失败：\n${failed.join('\n')}`);
+      pluginOperationNotice = {
+        type: 'warning',
+        title: '批量更新部分完成',
+        message: failed.join('\n')
+      };
+      notifyUser(`已完成批量更新，但 ${failed.length} 个插件失败：\n${failed.join('\n')}`, 'warn', {
+        title: '批量更新部分完成',
+        duration: 0
+      });
     } else {
+      pluginOperationNotice = null;
       log(`已完成 ${candidates.length} 个插件的更新`, 'success');
     }
+  } catch (error) {
+    log(`批量更新失败：${formatError(error)}`, 'error');
+    notifyError(error, { title: '批量更新失败' });
   } finally {
     pluginBulkUpdateRunning = false;
     if (currentTool === 'plugin-center') renderPluginCenterPage();
@@ -3573,7 +4167,7 @@ async function runPluginCenterUpdateAll(button) {
 }
 
 function bindPluginCenterActions(root) {
-  root.querySelector('[data-plugin-refresh]')?.addEventListener('click', () => loadPluginCatalog(true));
+  root.querySelector('[data-plugin-refresh]')?.addEventListener('click', () => refreshPluginCatalogFromUi());
   root.querySelector('[data-plugin-local-install]')?.addEventListener('click', async (event) => {
     event.currentTarget.disabled = true;
     try {
@@ -3581,9 +4175,9 @@ function bindPluginCenterActions(root) {
       if (result?.canceled) return;
       if (!result?.success) throw new Error(result?.error || '本地插件安装失败');
       await refreshProvidersAfterPluginChange();
-      await loadPluginCatalog(true);
+      await refreshPluginCatalogFromUi();
     } catch (error) {
-      alert(formatError(error));
+      notifyError(error, { title: '本地插件安装失败' });
     } finally {
       event.currentTarget.disabled = false;
     }
@@ -3623,11 +4217,22 @@ function renderPluginCenterPage() {
   const status = pluginCatalogState.offline
     ? `<div class="info-box plugin-offline"><strong>当前无法连接在线插件库</strong><p>${escapeHtml(pluginCatalogState.error || '仍可管理已安装插件，联网后点击刷新。')}</p></div>`
     : '';
+  const catalogError = pluginCatalogState.error && !pluginCatalogState.offline
+    ? `<div class="info-box plugin-offline"><strong>插件库读取失败</strong><p>${escapeHtml(pluginCatalogState.error)} 已保留本机插件状态，可稍后重试。</p></div>`
+    : '';
+  const operationNotice = pluginOperationNotice
+    ? `<div class="info-box plugin-operation-notice ${pluginOperationNotice.type === 'warning' ? 'warning' : ''}"><strong>${escapeHtml(pluginOperationNotice.title)}</strong><pre>${escapeHtml(pluginOperationNotice.message)}</pre></div>`
+    : '';
   const experimental = pluginCatalogState.experimentalError
     ? `<div class="info-box plugin-offline"><strong>实验插件库暂时无法读取</strong><p>稳定插件不受影响。${escapeHtml(pluginCatalogState.experimentalError)}</p></div>`
     : '<div class="info-box plugin-experimental-notice"><strong>实验性插件已标注</strong><p>它们会正常显示和搜索，但可能功能不完整或存在兼容性限制。</p></div>';
-  const updateCount = pluginUpdateCandidates().length;
+  const allUpdates = pluginUpdateCandidates();
+  const updateCount = allUpdates.filter((plugin) => !pluginOperationBlocked(plugin.id)).length;
+  const blockedUpdateCount = allUpdates.length - updateCount;
   const updateAllDisabled = !updateCount || pluginCatalogState.status === 'loading' || pluginCatalogState.offline || pluginBulkUpdateRunning;
+  const runningPluginNotice = blockedUpdateCount
+    ? `<div class="info-box plugin-operation-notice"><strong>当前任务仍在运行</strong><p>正在使用的插件暂时不能升级、停用、回滚或卸载；任务结束后可继续操作。批量更新会跳过 ${blockedUpdateCount} 个相关更新。</p></div>`
+    : '';
   contentArea.innerHTML = `
     <section class="view-panel plugin-center-hero">
       <div class="view-panel-header">
@@ -3649,12 +4254,17 @@ function renderPluginCenterPage() {
       </div>
     </section>
     ${status}
+    ${catalogError}
+    ${operationNotice}
     ${experimental}
+    ${runningPluginNotice}
     <section class="plugin-grid" data-plugin-grid>
       ${pluginGridHtml()}
     </section>
   `;
   bindPluginCenterActions(contentArea);
+  hydratePluginProgressUi(contentArea);
+  applyRunningControlState();
   if (pluginCatalogState.status === 'idle') loadPluginCatalog(false);
 }
 
@@ -4357,7 +4967,7 @@ function initializeManifestProviderHandlers(provider, actions, fields) {
     if (!result?.success) {
       loginDoneButton.disabled = false;
       loginDoneButton.textContent = '我已完成登录，保存凭证';
-      alert(result?.error || '当前登录任务没有等待确认');
+      notifyUser(result?.error || '当前登录任务没有等待确认', 'warn');
     }
   });
   actions.forEach((action) => {
@@ -4365,13 +4975,16 @@ function initializeManifestProviderHandlers(provider, actions, fields) {
     if (!button) return;
     button.addEventListener('click', async () => {
       if (action.openUrl) {
-        if (action.confirm && !confirm(action.confirm)) return;
+        if (action.confirm && !(await confirmUserAction(action.confirm, {
+          title: '确认打开外部页面',
+          confirmLabel: '打开页面'
+        }))) return;
         await window.electronAPI.openExternal(action.openUrl);
         return;
       }
       const script = action.script || provider.script;
       if (!script) {
-        alert('这个动作没有配置脚本，可能只是纯教程型平台。');
+        notifyUser('这个动作没有配置脚本，可能只是纯教程型平台。', 'info');
         return;
       }
       let args;
@@ -4381,12 +4994,15 @@ function initializeManifestProviderHandlers(provider, actions, fields) {
         if (error?.manifestField) {
           showManifestFieldError(provider, error.manifestField, formatError(error));
         } else {
-          alert(formatError(error));
+          notifyError(error, { title: '参数检查失败' });
         }
         return;
       }
-      if (action.confirm && !confirm(action.confirm)) return;
-      if (!confirmProviderExecution(provider, action)) return;
+      if (action.confirm && !(await confirmUserAction(action.confirm, {
+        title: '确认执行平台动作',
+        confirmLabel: '继续'
+      }))) return;
+      if (!(await confirmProviderExecution(provider, action))) return;
       if (action.kind === 'login' && loginDoneButton) {
         loginDoneButton.hidden = false;
         loginDoneButton.disabled = false;
@@ -4407,9 +5023,8 @@ function initializeManifestProviderHandlers(provider, actions, fields) {
         } else if (result.success) {
           const actionMode = action.actionName || action.label || '执行';
           const outcome = taskResultStatus(result, { provider: provider.id, mode: actionMode });
-          log(`完成：${action.label || provider.title}`, 'success');
           appendExportSuccessSponsorLogs(outcome, action);
-          if (result.data) log(JSON.stringify(result.data, null, 2), 'success');
+          if (result.data) log(JSON.stringify(result.data, null, 2), 'info');
           applyActionUpdates(provider, action, result.data || {});
           if (action.kind === 'scan' || action.scanToc || action.id === 'scan') {
             const nodes = normalizeTocNodes(provider.id, result.data || {});
@@ -4423,6 +5038,10 @@ function initializeManifestProviderHandlers(provider, actions, fields) {
             finishProgress(true, `目录读取完成，共 ${selectableTocIds(nodes).length} 篇`);
           } else {
             finishProgressForTaskResult(result, `${action.label || '任务'}完成`, {
+              provider: provider.id,
+              mode: action.actionName || action.label
+            });
+            logTaskResultCompletion(result, `${action.label || '任务'}完成`, {
               provider: provider.id,
               mode: action.actionName || action.label
             });
@@ -4470,7 +5089,7 @@ async function executeCustomPluginAction(provider, actionId, rawArgs) {
   if (isRunning || activeCommandOwner) {
     throw new Error('当前已有任务运行中，请等待结束或先停止当前任务。');
   }
-  if (!confirmProviderExecution(provider, action)) throw new Error('用户取消执行');
+  if (!(await confirmProviderExecution(provider, action))) throw new Error('用户取消执行');
   startProgress(action.progressTitle || action.label || provider.title, action.progressDetail || '正在执行插件动作...');
   const result = await runProviderCommand(action.script || provider.script, [...(action.args || []), ...args], {
     providerId: provider.id,
@@ -4635,7 +5254,13 @@ function loadAppPaths() {
     if (!paths?.userData) throw new Error('主进程未返回可用的用户数据目录');
     appPaths = paths;
     await pythonProcessStateReady;
-    await loadTaskHistory();
+    try {
+      await loadTaskHistory();
+    } catch (error) {
+      const historyError = formatError(error) || '读取任务历史失败';
+      appendDetailedLog('task-history', 'error', `任务历史读取失败：${historyError}`);
+      log('任务历史未能完整读取，但平台页面仍可正常打开。可在任务中心刷新后重试。', 'warn');
+    }
     appPathsStatus = 'ready';
     const pendingTool = pendingProviderTool;
     pendingProviderTool = '';
@@ -4662,7 +5287,13 @@ function loadAppPaths() {
 // Tool switching
 function switchTool(toolId) {
   const targetTool = toolId || DEFAULT_VIEW_ID;
-  if (isRunning && targetTool !== currentTool) {
+  const allowsActiveTaskNavigation = Boolean(
+    isRunning
+    && activeHistoryTask
+    && targetTool === taskOriginView(activeHistoryTask)
+  );
+  const allowsWorkbenchNavigation = PRIMARY_NAV_ITEMS.some((item) => item.id === targetTool);
+  if (isRunning && targetTool !== currentTool && !allowsWorkbenchNavigation && !allowsActiveTaskNavigation) {
     log('任务仍在运行中。为避免丢失当前表单和任务上下文，请等待任务结束或先停止任务。', 'warn');
     return false;
   }
@@ -4695,11 +5326,13 @@ function switchTool(toolId) {
 
   if (String(currentTool).startsWith('platform:')) {
     renderPlatformDetailPage(String(currentTool).slice('platform:'.length));
+    applyRunningControlState();
     return;
   }
 
   if (PRIMARY_NAV_ITEMS.some((item) => item.id === currentTool)) {
     renderAppView(currentTool);
+    applyRunningControlState();
     return;
   }
 
@@ -4722,10 +5355,12 @@ function switchTool(toolId) {
       if (currentTool !== config.id) return;
       renderProviderModeSwitcher(config);
       normalizeActionHierarchy(contentArea);
+      applyRunningControlState();
     }).catch((error) => {
       if (currentTool !== config.id) return;
       contentArea.innerHTML = `<div class="info-box"><strong>插件界面加载失败</strong><p>${escapeHtml(formatError(error))}</p></div>`;
       renderProviderModeSwitcher(config);
+      applyRunningControlState();
       log(`插件界面加载失败：${formatError(error)}`, 'error');
     });
     return true;
@@ -4755,6 +5390,7 @@ function switchTool(toolId) {
   if (config.type !== 'guide') {
     enhanceRecentInputsForProvider(currentTool);
   }
+  applyRunningControlState();
   return true;
 }
 
@@ -4843,7 +5479,7 @@ function initializeToolHandlers(toolId) {
       if (output) {
         await window.electronAPI.openPath(output);
       } else {
-        alert('请先指定输出目录');
+        notifyUser('请先指定输出目录。', 'warn');
       }
     });
   }
@@ -4860,18 +5496,18 @@ async function handleLogin(toolId) {
 
   const url = document.getElementById(`${prefix}-url`)?.value.trim() || '';
   if (!config.noUrl && !url) {
-    alert('请先填写 URL');
+    notifyUser('请先填写 URL。', 'warn');
     return;
   }
   try {
     validateZsxqUrlForTool(toolId, url);
   } catch (error) {
-    alert(formatError(error));
+    notifyError(error, { title: '参数检查失败' });
     return;
   }
 
   const args = config.noUrl ? ['--login'] : [config.urlParam, url, '--login'];
-  if (!confirmProviderExecution(config)) return;
+  if (!(await confirmProviderExecution(config))) return;
 
   startProgress(`登录：${config.title}`, '请在浏览器中完成登录，然后回到工具点击“我已完成登录，保存凭证”。');
   setLoginDoneButton(toolId, true);
@@ -4908,7 +5544,7 @@ async function handleYinxiangLogin() {
   const username = document.getElementById('yinxiang-username')?.value.trim();
   const password = document.getElementById('yinxiang-password')?.value || '';
   if (!username || !password) {
-    alert('请先填写印象笔记账号和密码。');
+    notifyUser('请先填写印象笔记账号和密码。', 'warn');
     return;
   }
 
@@ -5132,7 +5768,7 @@ async function saveImaConfig(prefix) {
   try {
     requireImaCredentials(prefix);
   } catch (error) {
-    alert(formatError(error));
+    notifyError(error, { title: 'ima 配置检查失败' });
     return;
   }
   const args = buildImaCredentialArgs(prefix);
@@ -5225,7 +5861,7 @@ async function readImaKnowledgeBases() {
     const data = await runImaImportCommand(buildImaImportArgs({ listKbs: true }), '读取 ima 可写知识库', '正在读取可导入的知识库列表...');
     if (data) renderImaKnowledgeBaseOptions(data.knowledgeBases || []);
   } catch (error) {
-    alert(formatError(error));
+    notifyError(error, { title: '读取 ima 知识库失败' });
   } finally {
     updateImaImportKnowledgeBaseState();
   }
@@ -5300,9 +5936,12 @@ async function runImaImportCommand(args, title, detail = '正在处理 ima 知�
       return null;
     }
     if (result.success) {
-      log(`${title}完成`, 'success');
-      if (result.data) log(JSON.stringify(result.data, null, 2), 'success');
+      if (result.data) log(JSON.stringify(result.data, null, 2), 'info');
       finishProgressForTaskResult(result, `${title}完成`, {
+        provider: 'ima-import',
+        mode: '导入'
+      });
+      logTaskResultCompletion(result, `${title}完成`, {
         provider: 'ima-import',
         mode: '导入'
       });
@@ -5411,32 +6050,32 @@ function initializeImaImportHandlers() {
         log(`目标文件夹读取完成：共 ${folderCount} 个文件夹。`, 'success');
       }
     } catch (error) {
-      alert(formatError(error));
+      notifyError(error, { title: '读取 ima 目标文件夹失败' });
     }
   });
   document.getElementById('ima-import-plan')?.addEventListener('click', async () => {
     try {
       await runImaImportCommand(buildImaImportArgs({ plan: true }), '扫描 ima 导入目录', '正在扫描本地可导入文件...');
     } catch (error) {
-      alert(formatError(error));
+      notifyError(error, { title: '扫描 ima 导入目录失败' });
     }
   });
   document.getElementById('ima-import-one')?.addEventListener('click', async () => {
     try {
       const args = buildImaImportArgs({ single: true });
-      if (!confirmImaImportWrite({ single: true })) return;
+      if (!(await confirmImaImportWrite({ single: true }))) return;
       await runImaImportCommand(args, 'ima 单文件导入测试', '正在上传第一个文件...');
     } catch (error) {
-      alert(formatError(error));
+      notifyError(error, { title: 'ima 单文件导入失败' });
     }
   });
   document.getElementById('ima-import-export')?.addEventListener('click', async () => {
     try {
       const args = buildImaImportArgs();
-      if (!confirmImaImportWrite()) return;
+      if (!(await confirmImaImportWrite())) return;
       await runImaImportCommand(args, 'ima 批量导入', '正在批量上传文件...');
     } catch (error) {
-      alert(formatError(error));
+      notifyError(error, { title: 'ima 批量导入失败' });
     }
   });
   document.getElementById('ima-import-stop')?.addEventListener('click', handleStop);
@@ -5445,7 +6084,7 @@ function initializeImaImportHandlers() {
     if (dir) {
       await window.electronAPI.openPath(dir);
     } else {
-      alert('请先选择本地文件目录');
+      notifyUser('请先选择本地文件目录。', 'warn');
     }
   });
 }
@@ -5496,7 +6135,7 @@ function buildYuqueImportArgs(options = {}) {
   return args;
 }
 
-function confirmImportWrite({ platform, operation, target, source, sourceFile = '', behavior = '' }) {
+async function confirmImportWrite({ platform, operation, target, source, sourceFile = '', behavior = '' }) {
   const details = [
     `平台：${platform}`,
     `操作：${operation}`,
@@ -5505,13 +6144,17 @@ function confirmImportWrite({ platform, operation, target, source, sourceFile = 
     `目标：${target || '未选择'}`,
     behavior
   ].filter(Boolean);
-  return confirm(
+  return confirmUserAction(
     `请核对本次写入信息：\n\n${details.join('\n')}\n\n` +
-    '确认后将开始向目标平台写入内容。'
+    '确认后将开始向目标平台写入内容。',
+    {
+      title: '确认写入目标平台',
+      confirmLabel: '开始写入'
+    }
   );
 }
 
-function confirmYuqueImportWrite({ single = false } = {}) {
+async function confirmYuqueImportWrite({ single = false } = {}) {
   const targetUrl = document.getElementById('yuque-import-url')?.value.trim() || '当前填写的目标知识库';
   const sourceDir = document.getElementById('yuque-import-output')?.value.trim() || '';
   const updateExisting = document.getElementById('yuque-import-update-existing')?.checked !== false;
@@ -5528,7 +6171,7 @@ function confirmYuqueImportWrite({ single = false } = {}) {
   });
 }
 
-function confirmImaImportWrite({ single = false } = {}) {
+async function confirmImaImportWrite({ single = false } = {}) {
   const kbSelect = document.getElementById('ima-import-kb-select');
   const folderSelect = document.getElementById('ima-import-folder-id');
   const knowledgeBase = kbSelect?.selectedOptions?.[0]?.textContent?.trim() || selectedImaKnowledgeBaseId();
@@ -5546,7 +6189,7 @@ function confirmImaImportWrite({ single = false } = {}) {
   });
 }
 
-function confirmYinxiangImportWrite({ single = false } = {}) {
+async function confirmYinxiangImportWrite({ single = false } = {}) {
   const sourceDir = document.getElementById('yinxiang-import-source')?.value.trim() || '';
   const sourceFile = document.getElementById('yinxiang-import-source-file')?.value.trim() || '';
   const notebook = document.getElementById('yinxiang-import-notebook')?.value.trim() || '默认笔记本';
@@ -5562,7 +6205,7 @@ function confirmYinxiangImportWrite({ single = false } = {}) {
   });
 }
 
-function confirmFeishuImportWrite({ single = false } = {}) {
+async function confirmFeishuImportWrite({ single = false } = {}) {
   const targetUrl = document.getElementById('feishu-import-url')?.value.trim() || '';
   const sourceDir = document.getElementById('feishu-import-source')?.value.trim() || '';
   const sourceFile = document.getElementById('feishu-import-source-file')?.value.trim() || '';
@@ -5605,8 +6248,7 @@ async function runYuqueImportCommand(args, title, detail = '正在处理语雀�
       finishProgress('stopped', `${title}已停止`);
       return null;
     } else if (result.success) {
-      log(`${title}完成`, 'success');
-      if (result.data) log(JSON.stringify(result.data, null, 2), 'success');
+      if (result.data) log(JSON.stringify(result.data, null, 2), 'info');
       if (result.data?.reportFile) {
         latestYuqueImportReportFile = result.data.reportFile;
         log(`报告已生成：${result.data.reportFile}`, 'info');
@@ -5629,6 +6271,10 @@ async function runYuqueImportCommand(args, title, detail = '正在处理语雀�
         log(`有 ${result.data.failureCount} 个文档失败，完整原因见：${reportFile}`, 'error');
       }
       finishProgressForTaskResult(result, `${title}完成`, {
+        provider: 'yuque-import',
+        mode: '导入'
+      });
+      logTaskResultCompletion(result, `${title}完成`, {
         provider: 'yuque-import',
         mode: '导入'
       });
@@ -5669,7 +6315,7 @@ function initializeYuqueImportHandlers() {
     try {
       await runYuqueImportCommand(buildYuqueImportArgs({ saveConfig: true }), '保存语雀导入配置', '正在保存本机配置...');
     } catch (error) {
-      alert(formatError(error));
+      notifyError(error, { title: '保存语雀导入配置失败' });
     }
   });
 
@@ -5677,27 +6323,30 @@ function initializeYuqueImportHandlers() {
     try {
       await runYuqueImportCommand(buildYuqueImportArgs({ plan: true }), '生成语雀导入计划', '正在扫描本地 Markdown 并验证目标知识库...');
     } catch (error) {
-      alert(formatError(error));
+      notifyError(error, { title: '生成语雀导入计划失败' });
     }
   });
 
   document.getElementById('yuque-import-one')?.addEventListener('click', async () => {
     try {
       const args = buildYuqueImportArgs({ single: true });
-      if (!confirmYuqueImportWrite({ single: true })) return;
+      if (!(await confirmYuqueImportWrite({ single: true }))) return;
       await runYuqueImportCommand(args, '语雀单篇导入测试', '正在导入第一篇 Markdown...');
     } catch (error) {
-      alert(formatError(error));
+      notifyError(error, { title: '语雀单篇导入失败' });
     }
   });
 
   document.getElementById('yuque-import-retry-failed')?.addEventListener('click', async () => {
     try {
-      if (confirm('将只重试上次导入报告中的失败文档。确认继续吗？')) {
+      if (await confirmUserAction('将只重试上次导入报告中的失败文档。确认继续吗？', {
+        title: '确认重试失败项',
+        confirmLabel: '重试失败项'
+      })) {
         await runYuqueImportCommand(buildYuqueImportArgs({ retryFailures: true }), '语雀重试失败文档', '正在读取上次报告并重试失败项...');
       }
     } catch (error) {
-      alert(formatError(error));
+      notifyError(error, { title: '重试语雀失败项失败' });
     }
   });
 
@@ -5705,7 +6354,7 @@ function initializeYuqueImportHandlers() {
     try {
       await window.electronAPI.openPath(latestYuqueImportReportPath());
     } catch (error) {
-      alert(formatError(error));
+      notifyError(error, { title: '打开语雀导入报告失败' });
     }
   });
 }
@@ -5747,7 +6396,7 @@ async function handleYinxiangImportLogin() {
   const username = document.getElementById('yinxiang-import-username')?.value.trim();
   const password = document.getElementById('yinxiang-import-password')?.value || '';
   if (!username || !password) {
-    alert('请填写印象笔记账号和密码。已有凭证时可以直接扫描目录或导入。');
+    notifyUser('请填写印象笔记账号和密码。已有凭证时可以直接扫描目录或导入。', 'warn');
     return;
   }
 
@@ -5800,9 +6449,12 @@ async function runYinxiangImportCommand(args, title, detail = '正在处理印�
       return null;
     }
     if (result.success) {
-      log(`${title}完成`, 'success');
-      if (result.data) log(JSON.stringify(result.data, null, 2), 'success');
+      if (result.data) log(JSON.stringify(result.data, null, 2), 'info');
       finishProgressForTaskResult(result, `${title}完成`, {
+        provider: 'yinxiang-import',
+        mode: '导入'
+      });
+      logTaskResultCompletion(result, `${title}完成`, {
         provider: 'yinxiang-import',
         mode: '导入'
       });
@@ -5845,27 +6497,27 @@ function initializeYinxiangImportHandlers() {
     try {
       await runYinxiangImportCommand(buildYinxiangImportArgs({ plan: true }), '扫描印象笔记导入目录', '正在扫描本地 Markdown 文件...');
     } catch (error) {
-      alert(formatError(error));
+      notifyError(error, { title: '扫描印象笔记导入目录失败' });
     }
   });
 
   document.getElementById('yinxiang-import-one')?.addEventListener('click', async () => {
     try {
       const args = buildYinxiangImportArgs({ single: true });
-      if (!confirmYinxiangImportWrite({ single: true })) return;
+      if (!(await confirmYinxiangImportWrite({ single: true }))) return;
       await runYinxiangImportCommand(args, '印象笔记单篇导入测试', '正在导入第一篇 Markdown...');
     } catch (error) {
-      alert(formatError(error));
+      notifyError(error, { title: '印象笔记单篇导入失败' });
     }
   });
 
   document.getElementById('yinxiang-import-export')?.addEventListener('click', async () => {
     try {
       const args = buildYinxiangImportArgs();
-      if (!confirmYinxiangImportWrite()) return;
+      if (!(await confirmYinxiangImportWrite())) return;
       await runYinxiangImportCommand(args, '印象笔记批量导入', '正在批量导入 Markdown...');
     } catch (error) {
-      alert(formatError(error));
+      notifyError(error, { title: '印象笔记批量导入失败' });
     }
   });
 
@@ -5875,7 +6527,7 @@ function initializeYinxiangImportHandlers() {
     if (dir) {
       await window.electronAPI.openPath(dir);
     } else {
-      alert('请先选择 Markdown 目录');
+      notifyUser('请先选择 Markdown 目录。', 'warn');
     }
   });
 }
@@ -5988,16 +6640,45 @@ function zsxqGroupLimitValue() {
   return Number.isFinite(limit) ? limit : 50;
 }
 
-function confirmLargeZsxqGroupExport(toolId) {
+async function confirmLargeZsxqGroupExport(toolId) {
   if (toolId !== 'zsxq-group') return true;
   const limit = zsxqGroupLimitValue();
   if (limit <= 1000) return true;
-  return window.confirm(
+  return confirmUserAction(
     `本次计划导出 ${limit} 条知识星球帖子。\n\n` +
     '连续长时间导出可能触发平台风控，严重时可能影响账号使用甚至被封号。\n' +
     '建议分批导出，并尽量不要让单次任务超过 24 小时。\n\n' +
-    '确认继续导出吗？'
+    '确认继续导出吗？',
+    {
+      title: '高风险批量导出确认',
+      confirmLabel: '继续导出',
+      danger: true
+    }
   );
+}
+
+async function confirmZsxqRecursiveExport(toolId) {
+  if (toolId !== 'zsxq-group') return true;
+  const followRelatedLinks = document.getElementById(`${toolId}-follow-related-links`);
+  if (!followRelatedLinks?.checked) return true;
+  const maxDepth = document.getElementById(`${toolId}-max-depth`)?.value;
+  const followLinkScope = document.getElementById(`${toolId}-follow-link-scope`)?.value;
+  const depth = Number.parseInt(maxDepth || '1', 10);
+  if (followLinkScope !== 'all' && depth <= 1) return true;
+  return confirmUserAction(
+    '关联帖子递归会显著增加请求并更容易触发知识星球风控。确认继续吗？',
+    {
+      title: '确认递归抓取关联帖子',
+      confirmLabel: '继续递归导出',
+      danger: true
+    }
+  );
+}
+
+async function confirmZsxqExportPreflight(toolId, options = {}) {
+  if (options.includeLarge !== false && !(await confirmLargeZsxqGroupExport(toolId))) return false;
+  if (!(await confirmZsxqRecursiveExport(toolId))) return false;
+  return true;
 }
 
 function providerCheckpointFile(toolId, output) {
@@ -6072,12 +6753,6 @@ function buildExportArgs(toolId, options = {}) {
       if (maxDepth) args.push('--max-depth', maxDepth);
       if (followLinkScope) args.push('--follow-link-scope', followLinkScope);
       if (toolId === 'zsxq-group') {
-        const depth = Number.parseInt(maxDepth || '1', 10);
-        if ((followLinkScope === 'all' || depth > 1) && !window.confirm(
-          '关联帖子递归会显著增加请求并更容易触发知识星球风控。确认继续吗？'
-        )) {
-          throw new Error('已取消关联帖子递归导出。');
-        }
         args.push('--follow-group-links');
       }
     }
@@ -6324,7 +6999,7 @@ function selectableTocIds(nodes) {
 function setAllTocSelected(toolId, selected) {
   const state = tocStates[toolId];
   if (!state?.loaded) {
-    alert('请先点击“读取目录”。');
+    notifyUser('请先点击“读取目录”。', 'warn');
     return;
   }
   state.selected = new Set(selected ? selectableTocIds(state.nodes) : []);
@@ -6334,7 +7009,7 @@ function setAllTocSelected(toolId, selected) {
 function invertTocSelection(toolId) {
   const state = tocStates[toolId];
   if (!state?.loaded) {
-    alert('请先点击“读取目录”。');
+    notifyUser('请先点击“读取目录”。', 'warn');
     return;
   }
   const all = selectableTocIds(state.nodes);
@@ -6431,12 +7106,13 @@ async function handleScanToc(toolId) {
   try {
     args = buildExportArgs(toolId, { forScan: true, includeSelection: false });
   } catch (error) {
-    alert(formatError(error));
+    notifyError(error, { title: '读取目录参数检查失败' });
     return;
   }
-  if (!confirmProviderExecution(config)) return;
+  if (!(await confirmZsxqExportPreflight(toolId, { includeLarge: false }))) return;
+  if (!(await confirmProviderExecution(config))) return;
 
-  startProgress(`读取目录：${config.title}`, '正在读取远端目录结构...');
+  startProgress(`读取目录：${config.title}`, '正在连接远端服务，准备读取目录结构...', { phase: 'directory' });
   log(`开始读取目录：${config.title}`, 'info');
 
   try {
@@ -6479,12 +7155,12 @@ async function handleExport(toolId) {
   try {
     args = buildExportArgs(toolId);
   } catch (error) {
-    alert(formatError(error));
+    notifyError(error, { title: `${actionName}参数检查失败` });
     return;
   }
-  if (!confirmLargeZsxqGroupExport(toolId)) return;
-  if (toolId === 'yuque-import' && !confirmYuqueImportWrite()) return;
-  if (!confirmProviderExecution(config)) return;
+  if (!(await confirmZsxqExportPreflight(toolId))) return;
+  if (toolId === 'yuque-import' && !(await confirmYuqueImportWrite())) return;
+  if (!(await confirmProviderExecution(config))) return;
 
   startProgress(`${actionName}：${config.title}`, `正在准备${actionName}任务...`);
   log(`开始${actionName}：${config.title}`, 'info');
@@ -6506,12 +7182,15 @@ async function handleExport(toolId) {
       finishProgress('stopped', `${actionName}已停止`);
     } else if (result.success) {
       const outcome = taskResultStatus(result, { provider: toolId, mode: actionName });
-      log(outcome === 'paused' ? `${actionName}因频率限制安全暂停，可稍后继续。` : `${actionName}完成`, outcome === 'paused' ? 'warn' : 'success');
       appendExportSuccessSponsorLogs(outcome, actionName);
       if (result.data) {
-        log(JSON.stringify(result.data, null, 2), 'success');
+        log(JSON.stringify(result.data, null, 2), 'info');
       }
       finishProgressForTaskResult(result, `${actionName}完成`, {
+        provider: toolId,
+        mode: actionName
+      });
+      logTaskResultCompletion(result, `${actionName}完成`, {
         provider: toolId,
         mode: actionName
       });
@@ -6546,6 +7225,7 @@ async function handleStop() {
         task.error = '';
         await saveTaskHistory();
         renderTaskHistory();
+        renderTaskStatusOrb();
       }
     }
     startProgress('正在停止任务', '已发送停止请求，等待当前进程退出...');
@@ -6581,14 +7261,15 @@ function applyPythonProcessState(state = {}) {
   if (!recoveredCommandOwner) return;
   const finishedTaskId = mainPythonProcessState.taskId || previous.taskId;
   const recoveredTask = taskHistory.find((task) => task.id === finishedTaskId);
-  if (recoveredTask && ['running', 'stopping'].includes(recoveredTask.status)) {
-    recoveredTask.status = mainPythonProcessState.lastStatus === 'stopped' ? 'stopped' : 'interrupted';
+    if (recoveredTask && ['running', 'stopping'].includes(recoveredTask.status)) {
+      recoveredTask.status = mainPythonProcessState.lastStatus === 'stopped' ? 'stopped' : 'interrupted';
     recoveredTask.finishedAt = new Date().toISOString();
     recoveredTask.error = mainPythonProcessState.lastStatus === 'stopped'
       ? ''
       : '任务在界面重载期间结束，最终结果未能回传；可以根据输出或检查点继续。';
     saveTaskHistory().catch((error) => log(`保存恢复任务状态失败：${formatError(error)}`, 'error'));
     renderTaskHistory();
+    renderTaskStatusOrb();
   }
   if (activeCommandOwner === recoveredCommandOwner) activeCommandOwner = null;
   recoveredCommandOwner = null;
@@ -6623,26 +7304,70 @@ function initializePluginDownloadProgress() {
   });
 }
 
-function isAllowedWhileRunningControl(control) {
-  return Boolean(control?.matches?.(
-    '[id$="-stop"], [id$="-login-done"], ' +
-    '[data-task-result-action="copy"], [data-task-result-action="copy-failures"], ' +
-    '[data-task-result-action="open-output"], [data-task-result-action="open-report"]'
-  ));
+function onboardingIsDismissed() {
+  try {
+    return localStorage.getItem(ONBOARDING_DISMISSED_STORAGE_KEY) === 'true';
+  } catch {
+    return false;
+  }
 }
 
-// Set running state
-function setRunning(running, toolId) {
-  isRunning = running;
+function closeOnboarding({ openTutorial = false } = {}) {
+  const backdrop = document.getElementById('onboarding-backdrop');
+  const neverShowAgain = document.getElementById('onboarding-dismiss-forever');
+  if (neverShowAgain?.checked) {
+    try {
+      localStorage.setItem(ONBOARDING_DISMISSED_STORAGE_KEY, 'true');
+    } catch {
+      // The app remains usable when browser storage is unavailable.
+    }
+  }
+  if (backdrop) backdrop.hidden = true;
+  if (openTutorial) switchTool('notice-center');
+}
+
+function initializeOnboarding() {
+  const backdrop = document.getElementById('onboarding-backdrop');
+  if (!backdrop || onboardingIsDismissed()) return;
+  backdrop.hidden = false;
+  window.setTimeout(() => {
+    document.getElementById('btn-onboarding-tutorial')?.focus();
+  }, 0);
+}
+
+function isPrimaryWorkbenchView(targetTool) {
+  return PRIMARY_NAV_ITEMS.some((item) => item.id === targetTool);
+}
+
+function isAllowedWhileRunningControl(control) {
+  if (!control?.matches) return false;
+  if (control.matches('[id$="-stop"], [id$="-login-done"], [data-task-orb-action], ' +
+    '[data-history-action="copy"], [data-history-action="copy-failures"], ' +
+    '[data-history-action="export-failure-log"], [data-history-action="open-output"], ' +
+    '[data-history-action="open-report"]')) {
+    return true;
+  }
+  if (control.matches('[data-tool]')) return isPrimaryWorkbenchView(control.dataset.tool);
+  if (control.matches('[data-switch-view]')) return isPrimaryWorkbenchView(control.dataset.switchView);
+  if (control.matches('[data-notice-id], [data-notice-action], [data-notice-open], [data-open-url], ' +
+    '[data-plugin-search], [data-plugin-search-clear], [data-plugin-refresh], [data-plugin-update-all]')) {
+    return true;
+  }
+  if (control.matches('[data-plugin-action]')) {
+    return !pluginOperationBlocked(control.dataset.pluginId);
+  }
+  return false;
+}
+
+function applyRunningControlState() {
   const lockableControls = document.querySelectorAll(
     '#content-area button, #content-area input, #content-area select, #content-area textarea, ' +
     '[data-switch-view], [data-platform-key], [data-open-provider], ' +
-    '[data-task-result-action="resume"], [data-task-result-action="task-center"], ' +
     '[data-history-action="resume"], #btn-history-resume-last, #btn-history-refresh'
   );
   lockableControls.forEach((control) => {
     if (isAllowedWhileRunningControl(control)) return;
-    if (running) {
+    if (isRunning) {
       if (!control.disabled) {
         control.disabled = true;
         control.dataset.disabledByRunning = 'true';
@@ -6664,15 +7389,26 @@ function setRunning(running, toolId) {
   });
 
   document.querySelectorAll('[id$="-stop"]').forEach((button) => {
-    button.disabled = !running;
-    button.setAttribute('aria-disabled', String(!running));
+    button.disabled = !isRunning;
+    button.setAttribute('aria-disabled', String(!isRunning));
   });
   const globalStopButton = document.getElementById('btn-global-stop');
   if (globalStopButton) {
-    globalStopButton.disabled = !running;
-    globalStopButton.setAttribute('aria-disabled', String(!running));
+    globalStopButton.disabled = !isRunning;
+    globalStopButton.setAttribute('aria-disabled', String(!isRunning));
   }
+}
+
+// Set running state
+function setRunning(running, toolId) {
+  const wasRunning = isRunning;
+  isRunning = running;
+  applyRunningControlState();
   renderProviderNavigation();
+  if (wasRunning !== running) {
+    if (currentTool === 'plugin-center') renderPluginCenterPage();
+    if (currentTool === 'platform-center') renderPlatformCenterPage();
+  }
 }
 
 function feishuImportConfigPath() {
@@ -6754,7 +7490,7 @@ async function openFeishuPermissionPage(scopes = FEISHU_IMPORT_REQUIRED_SCOPES) 
   const normalizedScopes = normalizeFeishuScopes(scopes);
   const url = buildFeishuPermissionUrl(normalizedScopes);
   if (!url) {
-    alert('请先填写飞书 App ID，再打开 API 权限申请页。');
+    notifyUser('请先填写飞书 App ID，再打开 API 权限申请页。', 'warn');
     return false;
   }
   const result = await window.electronAPI.openExternal(url);
@@ -6770,7 +7506,7 @@ async function openFeishuPermissionPage(scopes = FEISHU_IMPORT_REQUIRED_SCOPES) 
 async function openFeishuVersionPage() {
   const url = buildFeishuVersionUrl();
   if (!url) {
-    alert('请先填写飞书 App ID，再打开版本发布页。');
+    notifyUser('请先填写飞书 App ID，再打开版本发布页。', 'warn');
     return false;
   }
   const result = await window.electronAPI.openExternal(url);
@@ -6781,7 +7517,7 @@ async function openFeishuVersionPage() {
 async function openFeishuTargetWikiPage() {
   const wikiUrl = document.getElementById('feishu-import-url')?.value.trim() || '';
   if (!wikiUrl) {
-    alert('请先填写目标飞书 Wiki URL。');
+    notifyUser('请先填写目标飞书 Wiki URL。', 'warn');
     return false;
   }
   const result = await window.electronAPI.openExternal(wikiUrl);
@@ -6800,7 +7536,11 @@ async function setupFeishuOpenapiPermissions() {
 
 async function setupFeishuTargetWikiDocApp() {
   if (!requireFeishuWikiUrl()) return null;
-  if (!confirm('这会尝试修改目标 Wiki 的文档应用权限。请确认目标 Wiki 与当前飞书应用无误后继续。')) return null;
+  if (!(await confirmUserAction('这会尝试修改目标 Wiki 的文档应用权限。请确认目标 Wiki 与当前飞书应用无误后继续。', {
+    title: '确认授权目标 Wiki',
+    confirmLabel: '继续授权',
+    danger: true
+  }))) return null;
   return runFeishuImportCommand([...buildFeishuImportArgs(), '--setup-target-wiki-doc-app', '--yes'], '授权目标 Wiki 文档应用');
 }
 
@@ -6885,12 +7625,12 @@ async function saveFeishuImportConfigFromForm() {
   const appId = document.getElementById('feishu-import-app-id').value.trim();
   const appSecret = document.getElementById('feishu-import-app-secret').value.trim();
   if (!appId || !appSecret) {
-    alert('请先填写飞书 App ID 和 App Secret');
+    notifyUser('请先填写飞书 App ID 和 App Secret。', 'warn');
     return;
   }
   const configPath = feishuImportConfigPath();
   if (!configPath) {
-    alert('无法获取本机配置目录');
+    notifyUser('无法获取本机配置目录。', 'error');
     return;
   }
   const config = {
@@ -6905,10 +7645,10 @@ async function saveFeishuImportConfigFromForm() {
   if (result.success) {
     feishuImportConfig = config;
     log(`飞书导入 API 配置已保存：${configPath}`, 'success');
-    alert('已保存到本机配置文件。下次打开会自动读取。');
+    notifyUser('已保存到本机配置文件，下次打开会自动读取。', 'success');
   } else {
     log(`保存配置失败：${result.error}`, 'error');
-    alert(`保存配置失败：${result.error}`);
+    notifyError(new Error(result.error || '保存配置失败'), { title: '保存飞书配置失败' });
   }
 }
 
@@ -6918,7 +7658,7 @@ async function applyProbedFeishuTarget(data) {
   if (!spaceId || !parentWikiToken) {
     const message = '探测结果不完整：未同时返回 Space ID 和目标 Wiki Token，未替换现有目标配置。';
     log(message, 'error');
-    alert(message);
+    notifyUser(message, 'error', { title: '应用飞书探测结果失败' });
     return { updated: false, saved: false };
   }
 
@@ -6927,7 +7667,7 @@ async function applyProbedFeishuTarget(data) {
   if (!spaceInput || !parentInput) {
     const message = '飞书导入目标字段不可用，无法应用本次探测结果。';
     log(message, 'error');
-    alert(message);
+    notifyUser(message, 'error', { title: '应用飞书探测结果失败' });
     return { updated: false, saved: false };
   }
 
@@ -6952,7 +7692,7 @@ async function applyProbedFeishuTarget(data) {
   if (!configPath) {
     const message = '已将目标 Wiki 刷新到当前界面，但未能保存到本机配置：无法获取配置目录。';
     log(message, 'warn');
-    alert(message);
+    notifyUser(message, 'warn', { title: '飞书目标已更新但未保存', duration: 0 });
     return { updated: true, saved: false, spaceId, parentWikiToken };
   }
 
@@ -6960,7 +7700,7 @@ async function applyProbedFeishuTarget(data) {
   if (!writeResult?.success) {
     const message = `已将目标 Wiki 刷新到当前界面，但未能保存到本机配置：${writeResult?.error || '未知错误'}`;
     log(message, 'warn');
-    alert(message);
+    notifyUser(message, 'warn', { title: '飞书目标已更新但未保存', duration: 0 });
     return { updated: true, saved: false, spaceId, parentWikiToken };
   }
 
@@ -7167,9 +7907,12 @@ async function runFeishuImportCommand(args, taskName) {
         finishProgress('attention', attentionMessage);
         return result.data || {};
       }
-      log(`完成：${taskName}`, 'success');
-      log(JSON.stringify(result.data || {}, null, 2), 'success');
+      log(JSON.stringify(result.data || {}, null, 2), 'info');
       finishProgressForTaskResult(result, `${taskName}完成`, {
+        provider: 'feishu-import',
+        mode: '导入'
+      });
+      logTaskResultCompletion(result, `${taskName}完成`, {
         provider: 'feishu-import',
         mode: '导入'
       });
@@ -7194,7 +7937,7 @@ async function runFeishuImportCommand(args, taskName) {
 function requireFeishuWikiUrl() {
   const wikiUrl = document.getElementById('feishu-import-url')?.value.trim();
   if (!wikiUrl) {
-    alert('请先填写目标飞书 Wiki URL');
+    notifyUser('请先填写目标飞书 Wiki URL。', 'warn');
     return false;
   }
   return true;
@@ -7216,7 +7959,10 @@ function initializeFeishuImportHandlers() {
     });
   document.getElementById('feishu-import-open-console').addEventListener('click', async () => {
     await window.electronAPI.openExternal(FEISHU_DEVELOPER_CONSOLE_URL);
-    alert('已打开飞书开放平台。请创建企业自建应用，并在“凭证与基础信息”复制 App ID 和 App Secret。');
+    notifyUser('已打开飞书开放平台。请创建企业自建应用，并在“凭证与基础信息”复制 App ID 和 App Secret。', 'info', {
+      title: '飞书开放平台已打开',
+      duration: 0
+    });
   });
   document.getElementById('feishu-import-open-permission').addEventListener('click', async () => {
     await openFeishuPermissionPage();
@@ -7278,21 +8024,21 @@ function initializeFeishuImportHandlers() {
   document.getElementById('feishu-import-one').addEventListener('click', async () => {
     if (!requireFeishuWikiUrl()) return;
     if (!document.getElementById('feishu-import-source')?.value.trim()) {
-      alert('请先选择本地 Markdown 目录');
+      notifyUser('请先选择本地 Markdown 目录。', 'warn');
       return;
     }
     const args = [...buildFeishuImportArgs(), '--api-import-one', '--yes'];
-    if (!confirmFeishuImportWrite({ single: true })) return;
+    if (!(await confirmFeishuImportWrite({ single: true }))) return;
     await runFeishuImportCommand(args, '单篇导入测试');
   });
   document.getElementById('feishu-import-all').addEventListener('click', async () => {
     if (!requireFeishuWikiUrl()) return;
     if (!document.getElementById('feishu-import-source')?.value.trim()) {
-      alert('请先选择本地 Markdown 目录');
+      notifyUser('请先选择本地 Markdown 目录。', 'warn');
       return;
     }
     const args = [...buildFeishuImportArgs(), '--api-import-all', '--yes'];
-    if (!confirmFeishuImportWrite()) return;
+    if (!(await confirmFeishuImportWrite())) return;
     await runFeishuImportCommand(args, '批量导入');
   });
   document.getElementById('feishu-import-stop').addEventListener('click', handleStop);
@@ -7314,8 +8060,7 @@ document.addEventListener('DOMContentLoaded', () => {
     if (!isRunning) return;
     const control = event.target?.closest?.(
       '#content-area button, [data-tool], [data-switch-view], [data-platform-key], ' +
-      '[data-open-provider], [data-task-result-action="resume"], ' +
-      '[data-task-result-action="task-center"], [data-history-action="resume"], ' +
+      '[data-open-provider], [data-history-action="resume"], ' +
       '#btn-history-resume-last, #btn-history-refresh'
     );
     if (!control || isAllowedWhileRunningControl(control)) return;
@@ -7363,7 +8108,7 @@ document.addEventListener('DOMContentLoaded', () => {
   document.getElementById('btn-history-resume-last')?.addEventListener('click', () => {
     const task = latestResumableTask();
     if (!task) {
-      alert('没有可继续的失败或中断任务。');
+      notifyUser('没有可继续的失败或中断任务。', 'info');
       return;
     }
     resumeTask(task);
@@ -7399,12 +8144,20 @@ document.addEventListener('DOMContentLoaded', () => {
     handleTaskAction(task, button.dataset.historyAction)
       .catch((error) => log(`执行任务操作失败：${formatError(error)}`, 'error'));
   });
-  document.getElementById('task-result-card')?.addEventListener('click', (event) => {
-    const button = event.target.closest('[data-task-result-action]');
-    if (!button) return;
-    const task = latestFinishedTask();
-    handleTaskAction(task, button.dataset.taskResultAction)
-      .catch((error) => log(`执行任务操作失败：${formatError(error)}`, 'error'));
+  document.getElementById('task-status-orb')?.addEventListener('click', (event) => {
+    const action = event.target.closest('[data-task-orb-action]')?.dataset.taskOrbAction;
+    const task = activeTaskStatusOrbTask();
+    if (!action) return;
+    if (action === 'return') openTaskOrigin(task);
+    if (action === 'task-center') switchTool('task-center');
+    if (action === 'retry') resumeTask(task);
+    if (action === 'dismiss') dismissTaskStatusOrb();
+  });
+  document.getElementById('btn-onboarding-dismiss')?.addEventListener('click', () => {
+    closeOnboarding();
+  });
+  document.getElementById('btn-onboarding-tutorial')?.addEventListener('click', () => {
+    closeOnboarding({ openTutorial: true });
   });
   document.getElementById('btn-theme-toggle')?.addEventListener('click', toggleTheme);
   document.getElementById('btn-check-update')?.addEventListener('click', () => checkForUpdates(false));
@@ -7426,6 +8179,7 @@ document.addEventListener('DOMContentLoaded', () => {
   setLogCollapsed(true);
 
   loadAppPaths();
+  initializeOnboarding();
 
   if (window.electronAPI.onAppInfo) {
     window.electronAPI.onAppInfo((message) => {

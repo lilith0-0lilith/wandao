@@ -19,6 +19,7 @@
   "fields": [
     { "name": "book_url", "label": "语雀知识库 URL", "type": "text", "arg": "--book-url", "required": true, "history": "url", "actions": ["login", "scan", "export"] },
     { "name": "output", "label": "输出目录", "type": "directory", "arg": "--output", "required": true, "history": "path", "actions": ["export"] },
+    { "name": "include_source", "label": "显示来源链接", "type": "checkbox", "arg": "--include-source", "falseArg": "--no-source", "default": true, "actions": ["export"] },
     { "name": "incremental", "label": "增量导出", "type": "checkbox", "arg": "--incremental", "default": true, "advanced": true, "actions": ["export"] },
     { "name": "update_existing", "label": "更新已有文档", "type": "checkbox", "arg": "--update-existing", "default": false, "advanced": true, "actions": ["export"] },
     { "name": "retry_failed", "label": "只重试失败项", "type": "checkbox", "arg": "--retry-failed", "default": false, "advanced": true, "actions": ["export"] },

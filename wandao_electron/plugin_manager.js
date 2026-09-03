@@ -2,6 +2,7 @@ const fs = require('fs');
 const http = require('http');
 const https = require('https');
 const path = require('path');
+const crypto = require('crypto');
 const {
   assertSafeRelativePath,
   compareVersions,
@@ -12,10 +13,86 @@ const {
 
 const STATE_SCHEMA_VERSION = 1;
 const MAX_DOWNLOAD_BYTES = 128 * 1024 * 1024;
+const PLUGIN_ID_PATTERN = /^[a-z0-9][a-z0-9_-]{1,63}$/;
+const VERSION_PATTERN = /^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?$/;
+const PROTECTED_SOURCE_KINDS = new Set([
+  'bundled',
+  'bundled-plugin',
+  'builtin',
+  'builtin-plugin',
+  'built-in'
+]);
 
 function isInside(root, candidate) {
   const relative = path.relative(path.resolve(root), path.resolve(candidate));
   return relative === '' || (!relative.startsWith('..' + path.sep) && relative !== '..' && !path.isAbsolute(relative));
+}
+
+function lstatOrNull(target) {
+  try {
+    return fs.lstatSync(target);
+  } catch (error) {
+    if (error?.code === 'ENOENT') return null;
+    throw error;
+  }
+}
+
+function isLinkOrReparsePoint(target) {
+  const stat = lstatOrNull(target);
+  // On Windows, directory junctions are reported by lstat as symbolic links;
+  // checking lstat instead of stat prevents following a junction out of the
+  // managed plugin directory before an operation can validate its boundary.
+  return Boolean(stat?.isSymbolicLink());
+}
+
+function isPlainDirectory(target) {
+  const stat = lstatOrNull(target);
+  return Boolean(stat?.isDirectory() && !stat.isSymbolicLink());
+}
+
+function ensurePlainDirectoryOrMissing(target, label) {
+  const stat = lstatOrNull(target);
+  if (!stat) return false;
+  if (stat.isSymbolicLink()) {
+    throw new Error(`${label}不得是符号链接、目录联接或重解析点：${target}`);
+  }
+  if (!stat.isDirectory()) throw new Error(`${label}不是目录：${target}`);
+  return true;
+}
+
+function assertPluginId(pluginId) {
+  if (typeof pluginId !== 'string' || !PLUGIN_ID_PATTERN.test(pluginId)) {
+    throw new Error(`插件 ID 不合法：${pluginId || '(空)'}`);
+  }
+  return pluginId;
+}
+
+function idSet(value) {
+  if (value instanceof Set) return new Set(Array.from(value, String));
+  if (Array.isArray(value)) return new Set(value.map(String));
+  if (value && typeof value === 'object') return new Set(Object.keys(value).filter((key) => value[key]).map(String));
+  return new Set();
+}
+
+function metadataMarksProtected(metadata) {
+  if (!metadata || typeof metadata !== 'object' || Array.isArray(metadata)) return false;
+  if (metadata.bundled === true || metadata.builtin === true || metadata.builtIn === true) return true;
+  const sourceKind = String(metadata.sourceKind || metadata.source_kind || metadata.source || '').trim().toLowerCase();
+  return PROTECTED_SOURCE_KINDS.has(sourceKind);
+}
+
+function decodeUninstallTombstoneId(name) {
+  const match = String(name || '').match(/^\.uninstall-([0-9a-f]+)-[0-9a-f-]+$/i);
+  if (!match || match[1].length % 2 !== 0) return null;
+  let pluginId;
+  try {
+    const bytes = Buffer.from(match[1], 'hex');
+    pluginId = bytes.toString('utf8');
+    if (Buffer.from(pluginId, 'utf8').toString('hex').toLowerCase() !== match[1].toLowerCase()) return null;
+  } catch (_error) {
+    return null;
+  }
+  return PLUGIN_ID_PATTERN.test(pluginId) ? pluginId : null;
 }
 
 function writeJsonAtomic(filePath, value) {
@@ -95,9 +172,14 @@ class PluginManager {
     this.platform = options.platform || process.platform;
     this.registryUrl = options.registryUrl || '';
     this.allowLocalHttp = Boolean(options.allowLocalHttp);
+    this.bundledPluginIds = idSet(options.bundledPluginIds);
+    this.builtinPluginIds = idSet(options.builtinPluginIds);
+    this.bundledRoot = options.bundledRoot ? path.resolve(options.bundledRoot) : null;
+    this.builtinRoot = options.builtinRoot ? path.resolve(options.builtinRoot) : null;
     this.verifiedInstallCache = new Map();
     fs.mkdirSync(this.pluginsDir, { recursive: true });
-    this.recoverStagingDirectories();
+    ensurePlainDirectoryOrMissing(this.pluginsDir, '插件安装根目录');
+    this.recoverOperationDirectories();
   }
 
   defaultState() {
@@ -110,6 +192,23 @@ class PluginManager {
     return state;
   }
 
+  readStateStrict() {
+    const stat = lstatOrNull(this.stateFile);
+    if (!stat) return this.defaultState();
+    if (stat.isSymbolicLink()) throw new Error(`插件状态文件不得是符号链接或重解析点：${this.stateFile}`);
+    if (!stat.isFile()) throw new Error(`插件状态文件不是普通文件：${this.stateFile}`);
+    let state;
+    try {
+      state = JSON.parse(fs.readFileSync(this.stateFile, 'utf8'));
+    } catch (error) {
+      throw new Error(`插件状态文件已损坏：${error.message}`);
+    }
+    if (!state || state.schemaVersion !== STATE_SCHEMA_VERSION || !state.plugins || typeof state.plugins !== 'object' || Array.isArray(state.plugins)) {
+      throw new Error('插件状态文件的结构或版本无效');
+    }
+    return state;
+  }
+
   writeState(state) {
     state.schemaVersion = STATE_SCHEMA_VERSION;
     state.updatedAt = new Date().toISOString();
@@ -117,27 +216,75 @@ class PluginManager {
   }
 
   pluginRoot(pluginId) {
-    if (!/^[a-z0-9][a-z0-9_-]{1,63}$/.test(String(pluginId || ''))) throw new Error('插件 ID 不合法');
+    assertPluginId(pluginId);
     const target = path.join(this.pluginsDir, pluginId);
     if (!isInside(this.pluginsDir, target)) throw new Error('插件路径越界');
     return target;
   }
 
   versionRoot(pluginId, version) {
-    if (!/^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?$/.test(String(version || ''))) throw new Error('插件版本不合法');
+    if (typeof version !== 'string' || !VERSION_PATTERN.test(version)) throw new Error(`插件版本不合法：${version || '(空)'}`);
     return path.join(this.pluginRoot(pluginId), version);
   }
 
-  recoverStagingDirectories() {
-    if (!fs.existsSync(this.pluginsDir)) return;
-    for (const plugin of fs.readdirSync(this.pluginsDir, { withFileTypes: true })) {
-      if (!plugin.isDirectory()) continue;
+  recoverOperationDirectories() {
+    if (!isPlainDirectory(this.pluginsDir)) return;
+    const entries = fs.readdirSync(this.pluginsDir, { withFileTypes: true });
+    for (const plugin of entries) {
       const pluginDir = path.join(this.pluginsDir, plugin.name);
+      if (!plugin.isDirectory() || !isPlainDirectory(pluginDir)) continue;
       for (const entry of fs.readdirSync(pluginDir, { withFileTypes: true })) {
-        if (entry.isDirectory() && entry.name.startsWith('.staging-')) {
-          fs.rmSync(path.join(pluginDir, entry.name), { recursive: true, force: true });
+        const operationDir = path.join(pluginDir, entry.name);
+        if (entry.isDirectory() && entry.name.startsWith('.staging-') && isPlainDirectory(operationDir)) {
+          fs.rmSync(operationDir, { recursive: true, force: true });
         }
       }
+    }
+
+    // If the process stopped after rename() but before the state transaction,
+    // keep the tombstone until a trustworthy state file tells us whether the
+    // uninstall was committed.  A corrupt state must never cause data loss.
+    const state = this.readRecoveryState();
+    if (!state) return;
+    for (const entry of entries) {
+      const tombstone = path.join(this.pluginsDir, entry.name);
+      if (!entry.isDirectory() || !isPlainDirectory(tombstone)) continue;
+      const pluginId = decodeUninstallTombstoneId(entry.name);
+      if (!pluginId) continue;
+      const root = this.pluginRoot(pluginId);
+      const rootStat = lstatOrNull(root);
+      if (rootStat?.isSymbolicLink()) {
+        // Do not replace or remove a path that was changed into a link while
+        // the app was not running.  Leave the recovery directory for a later
+        // explicit repair instead of following an attacker-controlled path.
+        continue;
+      }
+      const stillInstalled = Object.prototype.hasOwnProperty.call(state.plugins, pluginId);
+      if (stillInstalled && !rootStat) {
+        fs.renameSync(tombstone, root);
+      } else {
+        fs.rmSync(tombstone, { recursive: true, force: true });
+      }
+    }
+  }
+
+  // Keep the old method name for callers from the first plugin-center build.
+  recoverStagingDirectories() {
+    return this.recoverOperationDirectories();
+  }
+
+  readRecoveryState() {
+    const stat = lstatOrNull(this.stateFile);
+    if (!stat) return this.defaultState();
+    if (stat.isSymbolicLink() || !stat.isFile()) return null;
+    try {
+      const state = JSON.parse(fs.readFileSync(this.stateFile, 'utf8'));
+      if (!state || state.schemaVersion !== STATE_SCHEMA_VERSION || !state.plugins || typeof state.plugins !== 'object' || Array.isArray(state.plugins)) {
+        return null;
+      }
+      return state;
+    } catch (_error) {
+      return null;
     }
   }
 
@@ -373,18 +520,109 @@ class PluginManager {
     return this.describeInstalled(pluginId);
   }
 
-  uninstall(pluginId) {
-    const state = this.readState();
-    if (!state.plugins[pluginId]) return false;
-    const root = this.pluginRoot(pluginId);
-    if (!isInside(this.pluginsDir, root)) throw new Error('拒绝删除越界插件目录');
-    fs.rmSync(root, { recursive: true, force: true });
+  readInstalledManifest(filePath) {
+    const stat = lstatOrNull(filePath);
+    if (!stat || stat.isSymbolicLink() || !stat.isFile()) return null;
+    return readJson(filePath);
+  }
+
+  installedManifests(root, stateEntry) {
+    if (!isPlainDirectory(root)) return [];
+    const candidates = [];
+    if (typeof stateEntry?.currentVersion === 'string' && VERSION_PATTERN.test(stateEntry.currentVersion)) {
+      candidates.push(path.join(root, stateEntry.currentVersion, 'plugin.json'));
+    }
+    candidates.push(path.join(root, 'plugin.json'));
+    for (const entry of fs.readdirSync(root, { withFileTypes: true })) {
+      const versionDir = path.join(root, entry.name);
+      if (!entry.isDirectory() || entry.name.startsWith('.') || !isPlainDirectory(versionDir)) continue;
+      candidates.push(path.join(versionDir, 'plugin.json'));
+    }
+    return Array.from(new Set(candidates))
+      .map((filePath) => this.readInstalledManifest(filePath))
+      .filter(Boolean);
+  }
+
+  isProtectedPlugin(pluginId, stateEntry, root) {
+    if (this.bundledPluginIds.has(pluginId) || this.builtinPluginIds.has(pluginId)) return true;
+    for (const bundledRoot of [this.bundledRoot, this.builtinRoot]) {
+      if (bundledRoot && isInside(bundledRoot, root)) return true;
+    }
+    if (metadataMarksProtected(stateEntry)) return true;
+    return this.installedManifests(root, stateEntry).some(metadataMarksProtected);
+  }
+
+  clearVerifiedInstallCache(pluginId) {
     Array.from(this.verifiedInstallCache.keys()).forEach((key) => {
       if (key.startsWith(`${pluginId}@`)) this.verifiedInstallCache.delete(key);
     });
-    delete state.plugins[pluginId];
-    this.writeState(state);
+  }
+
+  uninstall(pluginId) {
+    assertPluginId(pluginId);
+    const state = this.readStateStrict();
+    const hasStateEntry = Object.prototype.hasOwnProperty.call(state.plugins, pluginId);
+    const stateEntry = hasStateEntry ? state.plugins[pluginId] : null;
+    const root = this.pluginRoot(pluginId);
+    if (!isInside(this.pluginsDir, root)) throw new Error('拒绝删除越界插件目录');
+    const rootStat = lstatOrNull(root);
+    if (rootStat && (isLinkOrReparsePoint(root) || !rootStat.isDirectory())) {
+      throw new Error(`插件目录不得是符号链接、目录联接、重解析点或普通文件：${root}`);
+    }
+    if (this.isProtectedPlugin(pluginId, stateEntry, root)) {
+      throw new Error(`内置或随应用提供的插件不可卸载：${pluginId}`);
+    }
+    if (!hasStateEntry && !rootStat) return false;
+
+    const tombstone = rootStat ? this.uninstallTombstonePath(pluginId) : null;
+    if (tombstone && lstatOrNull(tombstone)) {
+      throw new Error(`插件卸载恢复目录已存在，拒绝覆盖：${tombstone}`);
+    }
+    if (tombstone) {
+      fs.renameSync(root, tombstone);
+    }
+
+    if (hasStateEntry) {
+      delete state.plugins[pluginId];
+      try {
+        // writeState() is already an atomic replace; keeping the directory in
+        // the tombstone until this succeeds makes the two changes recoverable.
+        this.writeState(state);
+      } catch (error) {
+        try {
+          if (tombstone && !lstatOrNull(root)) fs.renameSync(tombstone, root);
+        } catch (restoreError) {
+          throw new Error(`${error.message || error}；恢复插件目录失败：${restoreError.message || restoreError}`);
+        }
+        throw error;
+      }
+    }
+
+    if (tombstone) {
+      const tombstoneStat = lstatOrNull(tombstone);
+      if (tombstoneStat && !isLinkOrReparsePoint(tombstone)) {
+        try {
+          fs.rmSync(tombstone, { recursive: true, force: true });
+        } catch (_error) {
+          // The state transaction has already committed.  Leave a normal
+          // tombstone for startup recovery instead of reporting a false
+          // rollback or touching a path that may have changed concurrently.
+        }
+      }
+    }
+    this.clearVerifiedInstallCache(pluginId);
     return true;
+  }
+
+  uninstallTombstonePath(pluginId) {
+    assertPluginId(pluginId);
+    const encodedId = Buffer.from(pluginId, 'utf8').toString('hex');
+    const nonce = typeof crypto.randomUUID === 'function'
+      ? crypto.randomUUID()
+      : `${Date.now()}-${process.pid}-${Math.random().toString(16).slice(2)}`;
+    const tombstone = path.join(this.pluginsDir, `.uninstall-${encodedId}-${nonce}`);
+    if (!isInside(this.pluginsDir, tombstone)) throw new Error('插件卸载恢复目录越界');
+    return tombstone;
   }
 
   activePlugins() {

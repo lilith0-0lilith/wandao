@@ -100,6 +100,187 @@ class WandaoReportTests(unittest.TestCase):
         self.assertEqual(derive_outcome({"stopped": True}), "stopped")
         self.assertEqual(derive_outcome({"rateLimitedPaused": True}), "paused")
 
+    def test_resource_failure_count_adds_images_and_attachments(self) -> None:
+        report = finalize_report(
+            {
+                "imageFailureCount": 2,
+                "attachmentFailureCount": 3,
+            }
+        )
+
+        self.assertEqual(report["imageFailureCount"], 2)
+        self.assertEqual(report["attachmentFailureCount"], 3)
+        self.assertEqual(report["resourceFailureCount"], 5)
+        self.assertEqual(report["failureCount"], 0)
+        self.assertEqual(report["outcome"], "partial")
+
+    def test_legacy_resource_duplicate_does_not_count_as_document_failure(self) -> None:
+        report = finalize_report(
+            {
+                "failureCount": 0,
+                "failures": [{"url": "https://cdn.example.test/a.png", "error": "HTTP 500"}],
+                "imageFailures": [{"url": "https://cdn.example.test/a.png", "error": "HTTP 500"}],
+                "imageFailureCount": 1,
+            }
+        )
+
+        self.assertEqual(report["failureCount"], 0)
+        self.assertEqual(report["resourceFailureCount"], 1)
+        self.assertEqual(report["imageFailureCount"], 1)
+        self.assertEqual(report["outcome"], "partial")
+
+    def test_root_resource_warning_list_becomes_resource_details(self) -> None:
+        report = finalize_report(
+            {
+                "resourceWarnings": [
+                    {"url": "https://cdn.example.test/a.bin", "error": "HTTP 403"},
+                    "资源被跳过",
+                ]
+            }
+        )
+
+        self.assertEqual(report["failureCount"], 0)
+        self.assertEqual(report["resourceFailureCount"], 2)
+        self.assertEqual(len(report["resourceFailures"]), 2)
+        self.assertTrue(any(item.get("url") for item in report["resourceFailures"]))
+        self.assertTrue(any(item.get("warning") == "资源被跳过" for item in report["resourceFailures"]))
+
+    def test_nested_image_and_attachment_warnings_inherit_document_context(self) -> None:
+        report = finalize_report(
+            {
+                "documents": [
+                    {
+                        "relativePath": "目录/图片.md",
+                        "imageWarnings": [{"url": "https://cdn.example.test/image.png", "error": "404"}],
+                    },
+                    {
+                        "document": "目录/附件.md",
+                        "attachmentWarnings": [{"name": "guide.pdf", "error": "403"}],
+                    },
+                ]
+            }
+        )
+
+        self.assertEqual(report["imageFailureCount"], 1)
+        self.assertEqual(report["attachmentFailureCount"], 1)
+        self.assertEqual(report["resourceFailureCount"], 2)
+        image = next(item for item in report["resourceFailures"] if item["type"] == "image")
+        attachment = next(item for item in report["resourceFailures"] if item["type"] == "attachment")
+        self.assertEqual(image["relativePath"], "目录/图片.md")
+        self.assertEqual(attachment["document"], "目录/附件.md")
+
+    def test_local_image_alias_is_deduplicated_against_generic_resource_failure(self) -> None:
+        report = finalize_report(
+            {
+                "resourceFailures": [
+                    {
+                        "document": "a.md",
+                        "reason": "本地图片引用未修复：assets/a.png（找不到本地文件）",
+                    }
+                ],
+                "localImageReferenceFailures": [
+                    {"document": "a.md", "reference": "assets/a.png", "warning": "缺少本地图片"}
+                ],
+            }
+        )
+
+        self.assertEqual(report["resourceFailureCount"], 1)
+        self.assertEqual(report["imageFailureCount"], 1)
+        self.assertEqual(len(report["resourceFailures"]), 1)
+        self.assertEqual(report["resourceFailures"][0]["type"], "image")
+
+    def test_document_failure_with_url_and_image_word_is_not_a_resource(self) -> None:
+        report = finalize_report(
+            {
+                "failureCount": 1,
+                "failures": [
+                    {
+                        "relativePath": "正文.md",
+                        "url": "https://example.test/document",
+                        "error": "正文图片说明解析失败",
+                    }
+                ],
+            }
+        )
+
+        self.assertEqual(report["failureCount"], 1)
+        self.assertEqual(report.get("resourceFailureCount", 0), 0)
+        self.assertEqual(report["resourceFailures"], [])
+
+    def test_warning_count_only_and_warning_list_only_have_stable_counts(self) -> None:
+        count_only = finalize_report(
+            {"imageWarnings": 3, "attachmentWarnings": 0, "resourceWarnings": 4}
+        )
+        list_only = finalize_report(
+            {"imageWarnings": ["a", "b"], "attachmentWarnings": ["c"]}
+        )
+
+        self.assertEqual(count_only["imageFailureCount"], 3)
+        self.assertEqual(count_only["attachmentFailureCount"], 0)
+        self.assertEqual(count_only["resourceFailureCount"], 4)
+        self.assertEqual(count_only["resourceFailures"], [])
+        self.assertEqual(list_only["imageFailureCount"], 2)
+        self.assertEqual(list_only["attachmentFailureCount"], 1)
+        self.assertEqual(list_only["resourceFailureCount"], 3)
+        self.assertEqual(len(list_only["resourceFailures"]), 3)
+
+    def test_same_reference_is_counted_separately_for_image_and_attachment(self) -> None:
+        report = finalize_report(
+            {
+                "imageFailures": [{"url": "https://cdn.example.test/shared", "error": "image failed"}],
+                "attachmentFailures": [{"url": "https://cdn.example.test/shared", "error": "attachment failed"}],
+            }
+        )
+
+        self.assertEqual(report["imageFailureCount"], 1)
+        self.assertEqual(report["attachmentFailureCount"], 1)
+        self.assertEqual(report["resourceFailureCount"], 2)
+        self.assertEqual(len(report["resourceFailures"]), 2)
+
+    def test_generic_resource_is_upgraded_by_matching_concrete_failure(self) -> None:
+        report = finalize_report(
+            {
+                "resourceFailures": [{"url": "https://cdn.example.test/a.png", "error": "failed"}],
+                "imageFailures": [{"url": "https://cdn.example.test/a.png", "error": "failed", "kind": "image"}],
+            }
+        )
+
+        self.assertEqual(report["resourceFailureCount"], 1)
+        self.assertEqual(report["imageFailureCount"], 1)
+        self.assertEqual(len(report["resourceFailures"]), 1)
+        self.assertEqual(report["resourceFailures"][0]["type"], "image")
+
+    def test_explicit_counts_use_maximum_when_the_list_is_shorter_or_longer(self) -> None:
+        report = finalize_report(
+            {
+                "imageFailureCount": 5,
+                "attachmentFailureCount": 1,
+                "resourceFailureCount": 2,
+                "imageFailures": [{"url": "https://cdn.example.test/a.png"}],
+                "attachmentFailures": [
+                    {"url": "https://files.example.test/a.pdf"},
+                    {"url": "https://files.example.test/b.pdf"},
+                ],
+            }
+        )
+
+        self.assertEqual(report["imageFailureCount"], 5)
+        self.assertEqual(report["attachmentFailureCount"], 2)
+        self.assertEqual(report["resourceFailureCount"], 7)
+
+    def test_warning_wrapper_count_and_alias_list_use_the_larger_value(self) -> None:
+        report = finalize_report(
+            {
+                "imageWarnings": {
+                    "count": 5,
+                    "items": ["a", "b"],
+                }
+            }
+        )
+
+        self.assertEqual(report["imageFailureCount"], 5)
+        self.assertEqual(report["resourceFailureCount"], 5)
+
 
 if __name__ == "__main__":
     unittest.main()

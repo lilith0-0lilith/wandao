@@ -903,7 +903,7 @@ fn task_event_sink(app: AppHandle) -> TaskEventSink {
             // The raw structured line is already part of Output and remains
             // available to the renderer's detailed diagnostic parser.
         }
-        TaskRuntimeEvent::Diagnostic { level, message } => {
+        TaskRuntimeEvent::Diagnostic { level, message, .. } => {
             let prefix = match level {
                 DiagnosticLevel::Info => "",
                 DiagnosticLevel::Warn => "警告：",

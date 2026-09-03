@@ -59,9 +59,11 @@
           <div class="progress-track" role="progressbar" aria-label="任务进度" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0">
             <div class="progress-fill" id="progress-fill"></div>
           </div>
-          <div class="progress-detail" id="progress-detail" role="status" aria-live="polite" aria-atomic="true">等待任务开始</div>
+          <div class="progress-detail-row">
+            <div class="progress-detail" id="progress-detail" role="status" aria-live="polite" aria-atomic="true">等待任务开始</div>
+            <span class="progress-elapsed" id="progress-elapsed" aria-label="任务已用时">已用时 0 秒</span>
+          </div>
           <div class="sr-only" id="task-announcements" role="status" aria-live="polite" aria-atomic="true"></div>
-          <section class="task-result-card" id="task-result-card" aria-labelledby="task-result-title" tabindex="-1" hidden></section>
         </section>
 
         <div id="content-area"></div>
@@ -127,6 +129,21 @@
         </section>
       </main>
     </div>
+  </div>
+
+  <aside class="task-status-orb" id="task-status-orb" aria-label="最近任务状态" hidden></aside>
+
+  <div class="onboarding-backdrop" id="onboarding-backdrop" hidden>
+    <section class="onboarding-dialog" role="dialog" aria-modal="true" aria-labelledby="onboarding-title" aria-describedby="onboarding-description">
+      <p class="onboarding-kicker">开始使用</p>
+      <h2 id="onboarding-title">第一次使用万能导？</h2>
+      <p id="onboarding-description">建议先查看快速教程，了解登录、导入、导出和图片处理方式。</p>
+      <label class="onboarding-option"><input id="onboarding-dismiss-forever" type="checkbox"> 不再提示</label>
+      <div class="onboarding-actions">
+        <button class="btn-secondary" id="btn-onboarding-dismiss" type="button">先自己看看</button>
+        <button class="btn-primary" id="btn-onboarding-tutorial" type="button">查看快速教程</button>
+      </div>
+    </section>
   </div>
 
   <template id="template-zsxq-group">
@@ -757,6 +774,8 @@
   </template>
 
   <script src="tauri_bridge.js"></script>
+  <script src="error_protocol.js"></script>
+  <script src="feedback.js"></script>
   <script src="providers.js"></script>
   <script src="provider_runtime.js"></script>
   <script src="structured_logs.js"></script>

@@ -194,14 +194,84 @@ test('resource failures are retried when the provider supports failed-item retry
   const canResume = appJs.slice(appJs.indexOf('function canResumeTask'), appJs.indexOf('function resumeTaskDisabledReason'));
   const resumeArgs = appJs.slice(appJs.indexOf('function resumeTaskArgs'), appJs.indexOf('async function performTaskHistoryLoad'));
   const resumeTaskHandler = appJs.slice(appJs.indexOf('async function resumeTask'), appJs.indexOf('function latestResumableTask'));
-  const resultCard = appJs.slice(appJs.indexOf('function renderTaskResultCard'), appJs.indexOf('async function handleTaskAction'));
+  const taskDetails = appJs.slice(appJs.indexOf('function taskHistoryDetailsHtml'), appJs.indexOf('function activeTaskStatusOrbTask'));
 
   assert.match(canResume, /taskFailureCount\(task\)/);
   assert.match(resumeArgs, /taskFailureCount\(task\)/);
   assert.match(resumeTaskHandler, /const retryableFailures = taskFailureCount\(task\)/);
   assert.match(resumeTaskHandler, /失败项，共 \$\{retryableFailures\} 个/);
-  assert.match(resultCard, /图片或附件未完成。\$\{canResume \? '可仅重试失败项。'/);
-  assert.doesNotMatch(resultCard, /不会把它们误作“失败文档”自动重试/);
+  assert.match(taskDetails, /renderTaskFailureDetails\('图片失败', imageFailures, 'image'\)/);
+  assert.match(taskDetails, /task-history-recovery/);
+  assert.doesNotMatch(taskDetails, /不会把它们误作“失败文档”自动重试/);
+});
+
+test('unsupported providers do not advertise a retry-failed action', () => {
+  const appJs = fs.readFileSync('wandao_electron/renderer/app.js', 'utf8');
+  const label = appJs.slice(appJs.indexOf('function taskResumeActionLabel'), appJs.indexOf('async function performTaskHistoryLoad'));
+  assert.match(label, /const supportsFailureRetry = Boolean\(providerRetryFailureArg\(TOOLS\[task\?\.providerId\]/);
+  assert.match(label, /supportsFailureRetry && \(status === 'completed' \|\| status === 'partial'\)/);
+});
+
+test('historical task rendering normalizes legacy reports and keeps startup independent from history rendering', () => {
+  const appJs = fs.readFileSync('wandao_electron/renderer/app.js', 'utf8');
+  const normalizedReport = appJs.slice(appJs.indexOf('function normalizedTaskReport'), appJs.indexOf('function renderTaskFailureDetails'));
+  const taskDetails = appJs.slice(appJs.indexOf('function taskHistoryDetailsHtml'), appJs.indexOf('function activeTaskStatusOrbTask'));
+  const appPaths = appJs.slice(appJs.indexOf('function loadAppPaths'), appJs.indexOf('// Tool switching'));
+
+  assert.doesNotMatch(normalizedReport, /if \(task\?\.report\?\.stats\) return task\.report/);
+  assert.match(normalizedReport, /imageFailures: \[\]/);
+  assert.match(normalizedReport, /attachmentFailures: \[\]/);
+  assert.match(taskDetails, /const documentFailures = Array\.isArray\(report\.documentFailures\)/);
+  assert.match(taskDetails, /renderTaskFailureDetails\('图片失败', imageFailures, 'image'\)/);
+  assert.match(appPaths, /try \{\s*await loadTaskHistory\(\);\s*\} catch \(error\)/);
+  assert.match(appPaths, /平台页面仍可正常打开/);
+});
+
+test('latest task status orb offers direct retry for supported failed items', () => {
+  const appJs = fs.readFileSync('wandao_electron/renderer/app.js', 'utf8');
+  const orb = appJs.slice(appJs.indexOf('function activeTaskStatusOrbTask'), appJs.indexOf('function dismissTaskStatusOrb'));
+  const completion = appJs.slice(appJs.indexOf('function taskResultCompletionState'), appJs.indexOf('function finishProgressForTaskResult'));
+
+  assert.match(orb, /function canRetryFailureItems\(task\)/);
+  assert.match(orb, /data-task-orb-action="retry"/);
+  assert.match(orb, /只重新处理这次任务失败的文档或资源/);
+  assert.match(completion, /点击任务提示中的“重试失败项”直接重试/);
+});
+
+test('running tasks keep workbench navigation but block other platform actions', () => {
+  const appJs = fs.readFileSync('wandao_electron/renderer/app.js', 'utf8');
+  const switching = appJs.slice(appJs.indexOf('function switchTool'), appJs.indexOf('// Initialize tool event handlers'));
+  const guard = appJs.slice(appJs.indexOf('function isAllowedWhileRunningControl'), appJs.indexOf('function feishuImportConfigPath'));
+
+  assert.match(switching, /const allowsWorkbenchNavigation = PRIMARY_NAV_ITEMS\.some/);
+  assert.match(switching, /!allowsWorkbenchNavigation && !allowsActiveTaskNavigation/);
+  assert.match(guard, /if \(control\.matches\('\[data-tool\]'\)\) return isPrimaryWorkbenchView/);
+  assert.match(guard, /\[data-notice-id\], \[data-notice-action\]/);
+  assert.match(guard, /if \(control\.matches\('\[data-plugin-action\]'\)\) \{[\s\S]*return !pluginOperationBlocked/);
+});
+
+test('plugin center protects the plugin used by the active task', () => {
+  const appJs = fs.readFileSync('wandao_electron/renderer/app.js', 'utf8');
+  const pluginGuard = appJs.slice(appJs.indexOf('function runningTaskProviderId'), appJs.indexOf('function renderPluginCard'));
+  const actions = appJs.slice(appJs.indexOf('async function installPluginFromCatalog'), appJs.indexOf('async function runPluginCenterAction'));
+  const bulkUpdate = appJs.slice(appJs.indexOf('async function runPluginCenterUpdateAll'), appJs.indexOf('function bindPluginCenterActions'));
+
+  assert.match(pluginGuard, /TOOLS\[providerId\]\?\.pluginId/);
+  assert.match(pluginGuard, /\(isRunning \|\| mainPythonProcessState\.running\)[\s\S]*runningPluginId/);
+  assert.match(actions, /if \(pluginOperationBlocked\(plugin\.id\)\)/);
+  assert.match(bulkUpdate, /allCandidates\.filter\(\(plugin\) => !pluginOperationBlocked/);
+});
+
+test('resuming a historical task does not repeat an existing action prefix in its title', () => {
+  const appJs = fs.readFileSync('wandao_electron/renderer/app.js', 'utf8');
+  const subject = appJs.slice(appJs.indexOf('function taskResumeSubject'), appJs.indexOf('async function performTaskHistoryLoad'));
+  const handler = appJs.slice(appJs.indexOf('async function resumeTask'), appJs.indexOf('function latestResumableTask'));
+
+  assert.match(subject, /function taskResumeSubject\(task\)/);
+  assert.match(subject, /继续任务\|重试失败项/);
+  assert.match(handler, /const resumeSubject = taskResumeSubject\(task\)/);
+  assert.match(handler, /继续任务：\$\{resumeSubject\}/);
+  assert.doesNotMatch(handler, /继续任务：\$\{task\.title \|\| task\.script\}/);
 });
 
 test('resource diagnostics are not duplicated after reports are finalized', () => {
@@ -221,23 +291,28 @@ test('resource diagnostics are not duplicated after reports are finalized', () =
   assert.ok(!diagnostics.some((line) => line.includes('脚本没有返回逐项图片失败原因')));
 });
 
-test('latest task result card is persistent, actionable, and never overlays long forms', () => {
+test('latest task status stays compact while actionable details live in task center', () => {
   const appJs = fs.readFileSync('wandao_electron/renderer/app.js', 'utf8');
   const indexHtml = fs.readFileSync('wandao_electron/renderer/index.html', 'utf8');
   const styles = fs.readFileSync('wandao_electron/renderer/styles.css', 'utf8');
   const finishHistory = appJs.slice(appJs.indexOf('async function finishHistoryTask'), appJs.indexOf('async function runTrackedPythonCommand'));
 
   assert.ok(indexHtml.indexOf('id="progress-section"') < indexHtml.indexOf('id="content-area"'));
-  assert.match(indexHtml, /id="task-result-card"/);
-  assert.match(appJs, /function renderTaskResultCard\(task = latestFinishedTask\(\)\)/);
-  assert.match(appJs, /data-task-result-action="open-output"/);
-  assert.match(appJs, /data-task-result-action="open-report"/);
-  assert.match(appJs, /data-task-result-action="copy-failures"/);
-  assert.match(appJs, /data-task-result-action="resume"/);
-  assert.match(finishHistory, /latestFinishedTaskId = task\.id[\s\S]*renderTaskResultCard\(task\)/);
+  assert.match(indexHtml, /id="task-status-orb"/);
+  assert.doesNotMatch(indexHtml, /task-result-card/);
+  assert.match(appJs, /function renderTaskStatusOrb\(\)/);
+  assert.match(appJs, /data-task-orb-action="return"/);
+  assert.match(appJs, /data-task-orb-action="task-center"/);
+  assert.match(appJs, /function taskHistoryDetailsHtml\(task\)[\s\S]*<details class="task-history-details">/);
+  assert.match(appJs, /data-history-action="open-output"/);
+  assert.match(appJs, /data-history-action="open-report"/);
+  assert.match(appJs, /data-history-action="copy-failures"/);
+  assert.match(appJs, /data-history-action="resume"/);
+  assert.match(finishHistory, /latestFinishedTaskId = task\.id[\s\S]*renderTaskStatusOrb\(\)/);
   assert.match(styles, /\.progress-section \{[\s\S]*position: static/);
   assert.match(styles, /\.action-section \{[\s\S]*position: static/);
   assert.match(styles, /\.provider-mode-switcher \{[\s\S]*position: static/);
+  assert.match(styles, /\.task-status-orb \{[\s\S]*position: fixed/);
 });
 
 test('manual stop remains stopping until command completion records its terminal state', () => {

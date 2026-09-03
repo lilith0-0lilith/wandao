@@ -50,3 +50,22 @@ test('TOC cache hit is visible while opaque cache keys stay out of user logs', (
   }]);
   assert.equal(userLogs[0].message.includes('must-not-be-rendered'), false);
 });
+
+test('progress remains neutral after individual failures until the final partial summary', () => {
+  const userLogs = [];
+  const processor = createProcessor({
+    appendUserLog: (message, type) => userLogs.push({ message, type })
+  });
+
+  processor.handleEvent({
+    event: 'task.progress',
+    level: 'warn',
+    progress: { current: 3, total: 12 },
+    stats: { failureCount: 1, imageFailed: 1 }
+  });
+
+  assert.deepEqual(userLogs, [{
+    type: 'info',
+    message: '进度 3/12，图片失败 1，失败 1'
+  }]);
+});

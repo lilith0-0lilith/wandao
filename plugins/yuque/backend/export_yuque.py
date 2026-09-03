@@ -1190,10 +1190,11 @@ def export_book(args: argparse.Namespace) -> dict[str, Any]:
                 result = fetch_doc_markdown(cdp, int(book["id"]), doc, args)
                 markdown = result.get("markdown") or f"# {doc.get('title') or '未命名'}\n"
                 source_url = f"{book_url.rstrip('/')}/{doc.get('url')}"
-                markdown += (
-                    f"\n---\n\n来源: {source_url}\n"
-                    f"语雀文档ID: {key}\n"
-                )
+                if getattr(args, "include_source", True):
+                    markdown += (
+                        f"\n---\n\n来源: {source_url}\n"
+                        f"语雀文档ID: {key}\n"
+                    )
                 resources = normalize_resources(result.get("resources") or [], result.get("images") or [])
 
                 def emit_resource_progress(progress: dict[str, Any]) -> None:
@@ -1847,6 +1848,8 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--progress-every", type=int, default=20, help="Print progress after N documents")
     parser.add_argument("--request-delay", type=float, default=0.8, help="Fixed seconds to wait before each document/API request")
     parser.add_argument("--request-jitter", type=float, default=0.4, help="Extra random seconds added before each document/API request")
+    parser.add_argument("--include-source", dest="include_source", action="store_true", default=True, help="Append source links and document identifiers to exported Markdown")
+    parser.add_argument("--no-source", dest="include_source", action="store_false", help="Do not append source links or document identifiers to exported Markdown")
     parser.add_argument("--keep-remote-images", action="store_true", default=True, help="Keep remote image URLs when download fails")
     parser.add_argument("--drop-failed-images", dest="keep_remote_images", action="store_false", help="Remove image URL when download fails")
     parser.add_argument("--download-attachments", action="store_true", default=True, help="Download Yuque file attachments locally")

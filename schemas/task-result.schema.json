@@ -14,6 +14,11 @@
     "mode": { "type": "string" },
     "output": { "type": "string" },
     "reportFile": { "type": "string" },
+    "error": { "type": "string" },
+    "errorInfo": {
+      "$ref": "error.schema.json",
+      "description": "Optional structured error; legacy providers may only return error."
+    },
     "totalDocs": { "type": "integer", "minimum": 0 },
     "successCount": { "type": "integer", "minimum": 0 },
     "failureCount": { "type": "integer", "minimum": 0 },

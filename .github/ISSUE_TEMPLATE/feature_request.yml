@@ -6,27 +6,26 @@ body:
   - type: markdown
     attributes:
       value: |
-        如果是新增平台，请使用“新平台接入建议 / 共创认领”模板。
+        新平台请使用“新平台接入建议 / 共创认领”模板。
 
-        如果想认领这个 Issue，请直接在评论区回复“认领”，不需要在表单中填写认领计划。
+        如果想认领，请在 Issue 评论区回复“认领”。
   - type: checkboxes
     id: precheck
     attributes:
       label: 提交前确认（可选）
       options:
-        - label: 我已经搜索过已有 Issue 和 PR，暂时没有找到相同建议。
+        - label: 我已经搜索过已有 Issue 和 PR。
         - label: 这不是新增平台建议。
   - type: textarea
     id: description
     attributes:
       label: 功能建议
-      description: 请说明想解决什么问题，以及希望万能导怎么改。
-      placeholder: 例如：导出失败后，希望任务中心可以只重试失败的文档。
+      description: 请说明想解决什么问题，以及希望万能导怎么表现。
+      placeholder: 例如：导出失败后，只重试失败的文档和资源。
     validations:
       required: true
   - type: textarea
     id: references
     attributes:
       label: 示例、参考资料或截图（可选）
-      description: 可以提供公开链接、截图或你期望的效果。
-
+      description: 可直接拖入截图，或粘贴公开链接和示例内容。

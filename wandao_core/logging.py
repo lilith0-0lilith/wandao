@@ -15,6 +15,8 @@ import sys
 from datetime import datetime, timezone
 from typing import Any
 
+from .errors import normalize_error
+
 
 for _stream in (sys.stdout, sys.stderr):
     try:
@@ -83,8 +85,11 @@ def error_payload(error: BaseException | str | None) -> dict[str, Any]:
         status = getattr(error, "code", None) or getattr(error, "status", None)
         if status:
             payload["status"] = status
-        return mask_sensitive(payload)
-    return {"message": str(mask_sensitive(str(error)))}
+        payload = mask_sensitive(payload)
+        payload["errorInfo"] = normalize_error(error)
+        return payload
+    text = str(mask_sensitive(str(error)))
+    return {"message": text, "errorInfo": normalize_error(text)}
 
 
 class WandaoLogger:
@@ -116,6 +121,23 @@ class WandaoLogger:
             "message": message,
             **fields,
         }
+        # Keep the original ``error`` payload for older consumers, while
+        # making the versioned error contract available to every provider that
+        # uses the shared logger.  Provider scripts do not need to be migrated
+        # in lockstep: a plain string, an exception-shaped mapping, or an
+        # existing errorInfo object all normalize to the same additive field.
+        error_value = payload.get("error")
+        if error_value is not None or level.lower() in {"error", "fatal"} or event.endswith(".failed"):
+            existing_info = (
+                error_value.get("errorInfo")
+                if isinstance(error_value, dict) and isinstance(error_value.get("errorInfo"), dict)
+                else payload.get("errorInfo")
+            )
+            payload["errorInfo"] = normalize_error(
+                existing_info or error_value or message,
+                provider=self.provider,
+                operation=event,
+            )
         print(LOG_PREFIX + json.dumps(mask_sensitive(payload), ensure_ascii=False, separators=(",", ":")), flush=True)
 
     def info(self, event: str, message: str = "", **fields: Any) -> None:

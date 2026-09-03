@@ -42,10 +42,15 @@
 
     function structuredErrorText(event) {
       const parts = [];
-      if (event.error?.status) parts.push(`HTTP ${event.error.status}`);
-      if (event.error?.code) parts.push(String(event.error.code));
-      if (event.error?.message) parts.push(String(event.error.message));
-      if (event.error && !parts.length) parts.push(compactDiagnostic(event.error, 260));
+      const info = event.errorInfo
+        || (event.error && typeof event.error === 'object' ? event.error.errorInfo || event.error : null);
+      const error = event.error && typeof event.error === 'object' ? event.error : {};
+      if (info?.code) parts.push(String(info.code));
+      if (info?.userMessage) parts.push(String(info.userMessage));
+      if (error.status && !info?.status) parts.push(`HTTP ${error.status}`);
+      if (error.code && !info?.code) parts.push(String(error.code));
+      if (error.message && !info?.userMessage) parts.push(String(error.message));
+      if (!parts.length && event.error) parts.push(compactDiagnostic(event.error, 260));
       return parts.filter(Boolean).join('：');
     }
 
@@ -81,6 +86,12 @@
       if (eventName === 'task.failed') {
         return { type: 'error', message: formatUserError(error || message || '任务执行失败') };
       }
+      if (eventName === 'task.diagnostic') {
+        return {
+          type,
+          message: formatUserError(error || message || '任务诊断信息')
+        };
+      }
       if (eventName === 'task.progress') {
         const current = Number(progress.current || 0);
         const total = Number(progress.total || 0);
@@ -96,10 +107,15 @@
         if (Number.isFinite(stats.skippedDocs)) statParts.push(`跳过 ${stats.skippedDocs}`);
         if (Number.isFinite(stats.imageSuccess)) statParts.push(`图片 ${stats.imageSuccess}`);
         if (Number.isFinite(stats.attachmentSuccess)) statParts.push(`附件 ${stats.attachmentSuccess}`);
+        if (Number.isFinite(stats.imageFailed) && stats.imageFailed) statParts.push(`图片失败 ${stats.imageFailed}`);
+        if (Number.isFinite(stats.attachmentFailed) && stats.attachmentFailed) statParts.push(`附件失败 ${stats.attachmentFailed}`);
         if (Number.isFinite(stats.attachmentUploads)) statParts.push(`附件 ${stats.attachmentUploads}`);
         if (Number.isFinite(stats.failureCount) && stats.failureCount) statParts.push(`失败 ${stats.failureCount}`);
         if (current && total) {
-          return { type: stats.failureCount ? 'warn' : 'info', message: `进度 ${current}/${total}${statParts.length ? `，${statParts.join('，')}` : ''}` };
+          // A previous item can fail while the task continues normally. Keep
+          // progress messages neutral; the final partial-completion summary
+          // is the single warning that explains the overall outcome.
+          return { type: 'info', message: `进度 ${current}/${total}${statParts.length ? `，${statParts.join('，')}` : ''}` };
         }
         return null;
       }
@@ -126,6 +142,14 @@
 
     function updateProgressFromEvent(event) {
       const eventName = String(event.event || '');
+      if (eventName === 'task.started') {
+        const totals = event.totals || {};
+        const total = Number(totals.documents ?? totals.total ?? event.progress?.total ?? 0);
+        if (event.message || total) {
+          updateProgress(0, total, event.message || `任务已开始，共 ${total} 项`);
+        }
+        return;
+      }
       if (eventName.startsWith('toc.')) {
         if (eventName === 'toc.started' || eventName === 'toc.root') tocDiscovered = 0;
         const stats = event.stats || {};
@@ -164,6 +188,7 @@
       appendDetailedLog(structuredLogSource(event), type, message, {
         event: event.event || '',
         provider: event.provider || '',
+        errorInfo: event.errorInfo || (event.error && typeof event.error === 'object' ? event.error.errorInfo : null),
         data: event
       });
       updateProgressFromEvent(event);

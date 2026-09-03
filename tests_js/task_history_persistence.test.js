@@ -44,6 +44,7 @@ function createHarness(stored, { restoreTaskArgs, protectTaskArgs } = {}) {
     function taskHistoryPath() { return 'task-history.json'; }
     async function readJsonFileIfExists() { return JSON.parse(JSON.stringify(stored)); }
     function renderTaskHistory() {}
+    function renderTaskStatusOrb() {}
     function maskSensitiveValue(value) { return value; }
     function maskSensitiveText(value) { return value; }
     function appendDetailedLog() {}

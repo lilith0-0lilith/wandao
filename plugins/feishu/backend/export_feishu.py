@@ -2839,12 +2839,13 @@ def export_wiki(args: argparse.Namespace) -> dict[str, Any]:
                     already_restored=bool(session.get("restoredCookies")),
                 )
                 markdown = result.get("markdown") or f"# {doc.get('title') or '未命名'}\n"
-                markdown += (
-                    f"\n---\n\n来源: {doc.get('url') or origin + '/wiki/' + token}\n"
-                    f"飞书{'Wiki' if entry_kind == 'wiki' else ('Drive' if entry_kind == 'drive_folder' else 'Doc')}Token: {token}\n"
-                    f"飞书ObjToken: {doc.get('obj_token') or ''}\n"
-                    f"飞书ObjType: {doc.get('obj_type')}\n"
-                )
+                if getattr(args, "include_source", True):
+                    markdown += (
+                        f"\n---\n\n来源: {doc.get('url') or origin + '/wiki/' + token}\n"
+                        f"飞书{'Wiki' if entry_kind == 'wiki' else ('Drive' if entry_kind == 'drive_folder' else 'Doc')}Token: {token}\n"
+                        f"飞书ObjToken: {doc.get('obj_token') or ''}\n"
+                        f"飞书ObjType: {doc.get('obj_type')}\n"
+                    )
                 markdown, count, img_errors = localize_images(
                     cdp,
                     markdown,
@@ -3490,6 +3491,8 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--progress-every", type=int, default=10, help="Print progress after N documents")
     parser.add_argument("--request-delay", type=float, default=0.8, help="Fixed seconds to wait before each document/API request")
     parser.add_argument("--request-jitter", type=float, default=0.4, help="Extra random seconds added before each document/API request")
+    parser.add_argument("--include-source", dest="include_source", action="store_true", default=True, help="Append source links and platform identifiers to exported Markdown")
+    parser.add_argument("--no-source", dest="include_source", action="store_false", help="Do not append source links or platform identifiers to exported Markdown")
     parser.add_argument("--keep-remote-images", action="store_true", default=True, help="Keep remote image URLs when download fails")
     parser.add_argument("--drop-failed-images", dest="keep_remote_images", action="store_false", help="Remove image URL when download fails")
     parser.add_argument("--close-started-chrome", action="store_true", help="Close Chrome started by this script after export")

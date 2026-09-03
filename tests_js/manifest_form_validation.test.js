@@ -32,8 +32,8 @@ test('manifest action validation marks, announces, focuses, and clears field err
   assert.match(handlers, /input\?\.addEventListener\('change', \(\) => clearManifestFieldErrorIfValid\(provider, field\)\)/);
   assert.match(handlers, /if \(error\?\.manifestField\) \{[\s\S]*showManifestFieldError\(provider, error\.manifestField, formatError\(error\)\)/);
   const buildIndex = handlers.indexOf('args = buildManifestActionArgs(provider, action, fields);');
-  const actionConfirmIndex = handlers.indexOf("if (action.confirm && !confirm(action.confirm)) return;", buildIndex);
-  const providerConfirmIndex = handlers.indexOf('if (!confirmProviderExecution(provider, action)) return;', buildIndex);
+  const actionConfirmIndex = handlers.indexOf('if (action.confirm && !(await confirmUserAction(action.confirm', buildIndex);
+  const providerConfirmIndex = handlers.indexOf('if (!(await confirmProviderExecution(provider, action))) return;', buildIndex);
   assert.ok(buildIndex >= 0 && actionConfirmIndex > buildIndex);
   assert.ok(providerConfirmIndex > actionConfirmIndex);
   assert.match(styles, /\.manifest-tool-panel \.form-group\.has-error/);

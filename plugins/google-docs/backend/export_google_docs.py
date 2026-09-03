@@ -589,7 +589,7 @@ def save_attachment(ref: AttachmentRef, target_dir: Path, source_url: str, resou
     return relative
 
 
-def export_document_model(document: ExportedDocument, output: Path, title: str, *, source_url: str = ENTRY_URL, source: GoogleDocsSource | None = None, selected_node_ids: Iterable[str] | None = None, resource_files: dict[str, bytes] | None = None, progress_callback: Any | None = None) -> dict[str, Any]:
+def export_document_model(document: ExportedDocument, output: Path, title: str, *, source_url: str = ENTRY_URL, source: GoogleDocsSource | None = None, selected_node_ids: Iterable[str] | None = None, resource_files: dict[str, bytes] | None = None, progress_callback: Any | None = None, include_source: bool = False) -> dict[str, Any]:
     selected = [str(value) for value in (selected_node_ids or []) if str(value).strip()]
     if selected and source is None:
         raise GoogleDocsError("按目录导出时缺少 Google Docs 文档来源。")
@@ -639,6 +639,8 @@ def export_document_model(document: ExportedDocument, output: Path, title: str, 
             fallback = f"[{ref.name}]({ref.source})" if is_safe_markdown_link(ref.source) else ref.name
             markdown = markdown.replace(placeholder, fallback)
             markdown = markdown.replace(f"[{ref.name}](attachments/attachment-{ref.index:03d}.bin)", fallback)
+    if include_source:
+        markdown = markdown.rstrip() + f"\n\n---\n\n来源: {source_url}\n"
     markdown_path = document_dir / f"{sanitize_filename(title, fallback='Google Docs 文档')}.md"
     markdown_path.write_text(markdown, encoding="utf-8", newline="\n")
     return {
@@ -968,6 +970,7 @@ def export_document(args: argparse.Namespace) -> dict[str, Any]:
             source=source,
             selected_node_ids=args.node_id,
             progress_callback=lambda payload: emit_progress(args, payload),
+            include_source=args.include_source,
         )
         emit_progress(args, make_progress_payload(1, 1, result_data["imageCount"], result_data["imageSuccessCount"], result_data["attachmentCount"], result_data["attachmentSuccessCount"], "正在生成 Markdown"))
         report_path = Path(result_data["documentDir"]) / "00-导出报告.json"
@@ -1001,6 +1004,8 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--download-dir", default=str(default_data_dir() / "downloads" / "google-docs"), help="Plugin-owned temporary browser download directory")
     parser.add_argument("--node-id", action="append", default=[], help="Selected heading node id; repeat for multiple headings")
     parser.add_argument("--progress-every", type=int, default=1, help="Progress message interval")
+    parser.add_argument("--include-source", dest="include_source", action="store_true", default=True, help="Append the source link to exported Markdown")
+    parser.add_argument("--no-source", dest="include_source", action="store_false", help="Do not append the source link to exported Markdown")
     parser.add_argument("--port", type=int, default=DEFAULT_PORT, help="Dedicated browser debugging port")
     parser.add_argument("--profile-dir", default=str(default_profile_path()), help="Dedicated browser profile directory")
     parser.add_argument("--browser-path", default="", help="Chrome/Edge/Chromium executable path")

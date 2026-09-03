@@ -1,0 +1,27 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/tllovesxs/wandao/schemas/error.schema.json",
+  "title": "Wandao Error v1",
+  "type": "object",
+  "required": ["kind", "schemaVersion", "code", "category", "userMessage", "retryable"],
+  "properties": {
+    "kind": { "const": "wandao.error" },
+    "schemaVersion": { "const": 1 },
+    "code": {
+      "type": "string",
+      "pattern": "^[A-Z][A-Z0-9_\\-]{1,63}$"
+    },
+    "category": { "type": "string", "minLength": 1 },
+    "userMessage": { "type": "string", "minLength": 1 },
+    "message": { "type": "string" },
+    "recovery": { "type": "string" },
+    "retryable": { "type": "boolean" },
+    "correlationId": { "type": "string" },
+    "provider": { "type": "string" },
+    "operation": { "type": "string" },
+    "technicalMessage": { "type": "string" },
+    "status": {},
+    "details": { "type": "object", "additionalProperties": true }
+  },
+  "additionalProperties": true
+}

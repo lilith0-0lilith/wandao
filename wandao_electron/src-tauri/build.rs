@@ -14,6 +14,7 @@ const BUNDLED_PLUGIN_IDS: &[&str] = &[
     "dingtalk",
     "feishu",
     "google-docs",
+    "google_docs",
     "ima",
     "notion",
     "obsidian",
@@ -108,9 +109,10 @@ fn generate_bundled_plugin_hashes(manifest_dir: &Path) -> Result<(), String> {
         .map(|entry| entry.file_name().to_string_lossy().to_string())
         .collect();
     let discovered_refs: BTreeSet<&str> = discovered.iter().map(String::as_str).collect();
-    if discovered_refs != expected {
+    let missing: BTreeSet<&str> = expected.difference(&discovered_refs).copied().collect();
+    if !missing.is_empty() {
         return Err(format!(
-            "bundled plugin set mismatch: expected {expected:?}, found {discovered_refs:?}"
+            "bundled plugin source is missing required IDs {missing:?}; discovered {discovered_refs:?}"
         ));
     }
 

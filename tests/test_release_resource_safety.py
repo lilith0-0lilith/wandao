@@ -19,6 +19,8 @@ BUILD_WORKFLOW = REPO_ROOT / ".github" / "workflows" / "build-desktop.yml"
 DESKTOP_README = REPO_ROOT / "wandao_electron" / "README.md"
 RELEASE_GUIDE = REPO_ROOT / "docs" / "发布与回滚手册.md"
 PR_TEMPLATE = REPO_ROOT / ".github" / "PULL_REQUEST_TEMPLATE.md"
+MAINTAINER_PR_CHECKLIST = REPO_ROOT / "docs" / "maintainer-pr-checklist.md"
+RELEASE_TEMPLATE = REPO_ROOT / ".github" / "RELEASE_TEMPLATE.md"
 
 spec = importlib.util.spec_from_file_location("prepare_python_runtime", PREPARE_SCRIPT)
 prepare_python_runtime = importlib.util.module_from_spec(spec)
@@ -668,6 +670,8 @@ class TauriReleaseDocumentationContractTests(unittest.TestCase):
         desktop_readme = DESKTOP_README.read_text(encoding="utf-8")
         release_guide = RELEASE_GUIDE.read_text(encoding="utf-8")
         pr_template = PR_TEMPLATE.read_text(encoding="utf-8")
+        maintainer_checklist = MAINTAINER_PR_CHECKLIST.read_text(encoding="utf-8")
+        release_template = RELEASE_TEMPLATE.read_text(encoding="utf-8")
 
         self.assertIn("Tauri 2", desktop_readme)
         self.assertIn("Rust 1.88.0", desktop_readme)
@@ -684,8 +688,21 @@ class TauriReleaseDocumentationContractTests(unittest.TestCase):
         self.assertNotIn("electron-builder", release_guide)
         self.assertNotIn("dist/win-unpacked", release_guide)
 
-        self.assertIn("Rust 1.88.0", pr_template)
-        self.assertIn("Tauri 2 / Rust", pr_template)
+        for heading in (
+            "## 改动内容",
+            "## 解决的问题",
+            "## 测试方式",
+            "## 是否涉及破坏性变更",
+            "## 截图或日志",
+        ):
+            self.assertIn(heading, pr_template)
+        self.assertLess(len(pr_template), 1000)
+        self.assertIn("Rust 1.88.0", maintainer_checklist)
+        self.assertIn("Tauri 2", maintainer_checklist)
+        self.assertIn("图片已正确本地化", maintainer_checklist)
+        self.assertIn("不要求贡献者", maintainer_checklist)
+        self.assertIn("Windows 实机安装", release_template)
+        self.assertIn("macOS 实机安装", release_template)
         self.assertNotIn("Electron JS", pr_template)
 
 

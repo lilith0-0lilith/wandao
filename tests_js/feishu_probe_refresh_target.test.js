@@ -43,6 +43,7 @@ function loadTargetHelper({
     feishuImportConfig: { ...config },
     feishuImportConfigPath: () => configPath,
     log: (message, level) => logs.push({ message, level }),
+    notifyUser: (message, level, options) => alerts.push({ message, level, options }),
     alert: (message) => alerts.push(message)
   };
   vm.createContext(context);
@@ -95,7 +96,7 @@ test('partial probe result leaves both stale fields and config untouched', async
   assert.equal(harness.inputs['feishu-import-parent-token'].value, 'old-parent');
   assert.equal(harness.writes.length, 0);
   assert.equal(harness.logs.at(-1).level, 'error');
-  assert.match(harness.alerts.at(-1), /探测结果不完整/);
+  assert.match(harness.alerts.at(-1).message, /探测结果不完整/);
 });
 
 test('write failure keeps the latest target in the current form and warns', async () => {
@@ -114,7 +115,7 @@ test('write failure keeps the latest target in the current form and warns', asyn
   assert.equal(harness.inputs['feishu-import-parent-token'].value, 'new-parent');
   assert.equal(harness.context.feishuImportConfig.space_id, 'old-space');
   assert.equal(harness.logs.at(-1).level, 'warn');
-  assert.match(harness.alerts.at(-1), /未能保存到本机配置/);
+  assert.match(harness.alerts.at(-1).message, /未能保存到本机配置/);
 });
 
 test('missing config path keeps the current form update without attempting a write', async () => {
@@ -128,7 +129,7 @@ test('missing config path keeps the current form update without attempting a wri
   assert.equal(result.saved, false);
   assert.equal(harness.writes.length, 0);
   assert.equal(harness.inputs['feishu-import-space-id'].value, 'new-space');
-  assert.match(harness.alerts.at(-1), /未能保存到本机配置/);
+  assert.match(harness.alerts.at(-1).message, /未能保存到本机配置/);
 });
 
 test('the dedicated probe handler awaits the target refresh helper', () => {

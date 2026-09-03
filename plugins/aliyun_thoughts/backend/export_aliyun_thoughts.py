@@ -2059,7 +2059,8 @@ def export_workspace(args: argparse.Namespace) -> dict[str, Any]:
                 markdown = re.sub(r"^#\s+[^\n]+", f"# {doc.title}", markdown, count=1)
                 markdown = rewrite_internal_links(markdown, md_path, {**planned_doc_paths, **doc_paths})
                 markdown = append_child_doc_links(markdown, doc, children, {**planned_doc_paths, **doc_paths}, md_path)
-                markdown += f"\n---\n\n来源: https://thoughts.aliyun.com/workspaces/{workspace_id}/docs/{doc.id}\n"
+                if getattr(args, "include_source", True):
+                    markdown += f"\n---\n\n来源: https://thoughts.aliyun.com/workspaces/{workspace_id}/docs/{doc.id}\n"
                 markdown, count, img_errors = localize_images(
                     markdown,
                     result.get("images") or [],
@@ -2630,6 +2631,8 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--progress-every", type=int, default=20, help="Print progress after N documents")
     parser.add_argument("--request-delay", type=float, default=0.1, help="Fixed seconds to wait before each document/API request")
     parser.add_argument("--request-jitter", type=float, default=0.0, help="Extra random seconds added before each document/API request")
+    parser.add_argument("--include-source", dest="include_source", action="store_true", default=True, help="Append source links to exported Markdown")
+    parser.add_argument("--no-source", dest="include_source", action="store_false", help="Do not append source links to exported Markdown")
     parser.add_argument("--keep-remote-images", action="store_true", default=True, help="Keep remote image URLs when download fails")
     parser.add_argument("--drop-failed-images", dest="keep_remote_images", action="store_false", help="Remove image URL when download fails")
     parser.add_argument("--close-started-chrome", action="store_true", help="Close Chrome started by this script after export")

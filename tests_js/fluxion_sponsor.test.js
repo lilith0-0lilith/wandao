@@ -45,22 +45,20 @@ test('export sponsor logs only appear for fully completed export actions', () =>
   assert.equal(logs.length, 2);
 });
 
-test('all export completion entry points insert sponsor logs before structured details', () => {
+test('all export completion entry points place sponsor logs before structured details and the final outcome', () => {
   const resume = sourceBetween('async function resumeTask(task) {', '\nfunction latestResumableTask(');
   const manifest = sourceBetween('function initializeManifestProviderHandlers(provider, actions, fields) {', '\nfunction sandboxPluginHtml(');
   const regular = sourceBetween('async function handleExport(toolId) {', '\n// Handle stop');
 
-  for (const [source, completion] of [
-    [resume, '历史任务继续执行完成'],
-    [manifest, '完成：${action.label || provider.title}'],
-    [regular, '${actionName}完成']
-  ]) {
-    const completionIndex = source.indexOf(completion);
-    const sponsorIndex = source.indexOf('appendExportSuccessSponsorLogs', completionIndex);
+  for (const source of [resume, manifest, regular]) {
+    const sponsorIndex = source.indexOf('appendExportSuccessSponsorLogs');
     const detailIndex = source.indexOf('JSON.stringify(result.data', sponsorIndex);
-    assert.notEqual(completionIndex, -1);
-    assert.ok(sponsorIndex > completionIndex);
+    const progressIndex = source.indexOf('finishProgressForTaskResult', detailIndex);
+    const outcomeIndex = source.indexOf('logTaskResultCompletion', progressIndex);
+    assert.notEqual(sponsorIndex, -1);
     assert.ok(detailIndex > sponsorIndex);
+    assert.ok(progressIndex > detailIndex);
+    assert.ok(outcomeIndex > progressIndex);
   }
 });
 

@@ -70,6 +70,17 @@
       "actions": [
         "export"
       ]
+    },
+    {
+      "name": "include_source",
+      "label": "显示来源链接",
+      "type": "checkbox",
+      "arg": "--include-source",
+      "falseArg": "--no-source",
+      "default": true,
+      "actions": [
+        "export"
+      ]
     }
   ],
   "actions": [

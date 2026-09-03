@@ -575,7 +575,8 @@ class TauriHealthTests(unittest.TestCase):
         self.assertIn("if (isRunning || activeCommandOwner)", app_js)
         self.assertIn("if (activeCommandOwner === owner)", app_js)
         self.assertIn("#content-area button, #content-area input", app_js)
-        self.assertIn("navigationLocked ? 'disabled aria-disabled", app_js)
+        self.assertIn("isRunning) {", app_js)
+        self.assertIn("control.dataset.disabledByRunning", app_js)
 
     def test_renderer_recovers_a_python_task_that_survives_reload(self) -> None:
         commands_rs = read_text("wandao_electron/src-tauri/src/commands.rs")
@@ -700,7 +701,8 @@ class TauriHealthTests(unittest.TestCase):
             "wandao_browser.py",
             "gui_utils.py",
         }
-        self.assertEqual(resources["../../plugins/"], "plugins/")
+        self.assertEqual(resources["../../plugins/google-docs/"], "plugins/google-docs/")
+        self.assertEqual(resources["../../plugins/google_docs/"], "plugins/google_docs/")
         self.assertEqual(resources["../../providers/"], "providers/")
         self.assertEqual(resources["../runtime/python-runtime/"], "python-runtime/")
         self.assertTrue((REPO_ROOT / "wandao_core" / "__init__.py").is_file())
@@ -739,7 +741,7 @@ class TauriHealthTests(unittest.TestCase):
 
         ids_start = build_rs.index("const BUNDLED_PLUGIN_IDS")
         ids_end = build_rs.index("];", ids_start)
-        declared_ids = set(re.findall(r'"([a-z0-9_]+)"', build_rs[ids_start:ids_end]))
+        declared_ids = set(re.findall(r'"([a-z0-9_-]+)"', build_rs[ids_start:ids_end]))
         plugin_root = REPO_ROOT / "plugins"
         repository_ids = {
             path.name
@@ -747,7 +749,7 @@ class TauriHealthTests(unittest.TestCase):
             if path.is_dir() and (path / "plugin.json").is_file()
         }
         self.assertEqual(declared_ids, repository_ids)
-        self.assertEqual(len(declared_ids), 17)
+        self.assertEqual(len(declared_ids), 19)
         self.assertIn("generate_bundled_plugin_hashes(&manifest_dir)", build_rs)
         self.assertIn('include!(concat!(env!("OUT_DIR"), "/bundled_plugin_hashes.rs"))', plugins_rs)
         self.assertIn("verify_bundled_plugin(&paths.bundled_plugins, &id)", commands_rs)
@@ -788,7 +790,8 @@ class TauriHealthTests(unittest.TestCase):
         self.assertIn("replaceExternal", providers_js)
         self.assertNotIn("id: 'wiz'", providers_js)
         self.assertNotIn("id: 'feishu-export'", providers_js)
-        self.assertEqual(tauri_config["bundle"]["resources"]["../../plugins/"], "plugins/")
+        self.assertEqual(tauri_config["bundle"]["resources"]["../../plugins/google-docs/"], "plugins/google-docs/")
+        self.assertEqual(tauri_config["bundle"]["resources"]["../../plugins/google_docs/"], "plugins/google_docs/")
         self.assertEqual(tauri_config["bundle"]["resources"]["../assets/"], "assets/")
         self.assertIn("bundled_plugin_catalog", commands_rs)
         self.assertIn("plugin_catalog_with_bundled", commands_rs)

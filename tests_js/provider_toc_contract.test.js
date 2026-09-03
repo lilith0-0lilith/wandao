@@ -71,6 +71,14 @@ const fixtures = {
     rootId: 'feishu-export:folder', docId: 'feishu-export:doc', parentId: 'feishu-export:folder', exportId: 'doc',
     args: ['--doc-id', 'doc']
   },
+  'google-docs-export': {
+    payload: { nodes: [
+      { nodeId: 'google-docs:root', exportId: '', title: 'Document', parentNodeId: '', selectable: false },
+      { nodeId: 'google-docs:heading-1', exportId: 'heading-1', title: 'Section', parentNodeId: 'google-docs:root', selectable: true }
+    ] },
+    rootId: 'google-docs:root', docId: 'google-docs:heading-1', parentId: 'google-docs:root', exportId: 'heading-1',
+    args: ['--node-id', 'heading-1']
+  },
   'ima-export': {
     payload: { nodes: [
       { nodeId: 'ima-kb:demo', exportId: '', title: 'Knowledge base', parentNodeId: '', selectable: false },

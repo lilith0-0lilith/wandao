@@ -27,6 +27,8 @@ NODE_CHECK_FILES = [
     "wandao_electron/provider_script_routing.js",
     "wandao_electron/plugin_state_migration.js",
     "wandao_electron/renderer/tauri_bridge.js",
+    "wandao_electron/renderer/error_protocol.js",
+    "wandao_electron/renderer/feedback.js",
     "wandao_electron/renderer/app.js",
     "wandao_electron/provider_legacy_compat.js",
     "wandao_electron/renderer/providers.js",
@@ -161,7 +163,7 @@ def run_node_checks() -> None:
                 "const resourceTask={report:r.normalizeTaskReport({imageFailureCount:2,resourceFailures:[{error:'x'},{error:'y'}]})};"
                 "if(r.taskFailureCount(resourceTask)!==2) process.exit(1);"
                 "const warningReport=r.normalizeTaskReport({totalDocs:1,resourceWarnings:[{target:'missing.png',reason:'local_file_missing'}]});"
-                "if(warningReport.stats.failed!==0||warningReport.failures.length!==0) process.exit(1);"
+                "if(warningReport.stats.failed!==0||warningReport.documentFailures.length!==0||warningReport.resourceFailures.length!==1) process.exit(1);"
             ),
         ],
         cwd=REPO_ROOT,

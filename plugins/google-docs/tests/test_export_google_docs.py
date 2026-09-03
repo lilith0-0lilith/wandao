@@ -178,6 +178,35 @@ class GoogleDocsPluginTests(unittest.TestCase):
         args = backend.parse_args(["--node-id", "heading-1", "--node-id", "heading-2"])
         self.assertEqual(args.node_id, ["heading-1", "heading-2"])
 
+    def test_source_link_can_be_included_or_omitted(self):
+        with_source = backend.parse_args(["--include-source"])
+        without_source = backend.parse_args(["--no-source"])
+        self.assertTrue(with_source.include_source)
+        self.assertFalse(without_source.include_source)
+
+        document = backend.parse_exported_html("<h1>来源选项</h1><p>正文</p>")
+        with tempfile.TemporaryDirectory() as temp:
+            source_url = "https://docs.google.com/document/d/fixture/edit"
+            result = backend.export_document_model(
+                document,
+                Path(temp),
+                "来源选项",
+                source_url=source_url,
+                include_source=True,
+            )
+            markdown = Path(result["output"]).read_text(encoding="utf-8")
+            self.assertIn(f"来源: {source_url}", markdown)
+
+            backend.export_document_model(
+                document,
+                Path(temp),
+                "来源选项-关闭",
+                source_url=source_url,
+                include_source=False,
+            )
+            without_markdown = Path(temp, "来源选项-关闭", "来源选项-关闭.md").read_text(encoding="utf-8")
+            self.assertNotIn("来源:", without_markdown)
+
     def test_parses_html_and_converts_supported_markdown(self):
         html = (FIXTURES / "document-with-resources.html").read_text(encoding="utf-8")
         document = backend.parse_exported_html(html)

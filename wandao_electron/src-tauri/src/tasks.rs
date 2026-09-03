@@ -7,7 +7,7 @@
 //! the runtime from becoming another script-routing authority.
 
 use serde::{Deserialize, Serialize};
-use serde_json::{Map, Value};
+use serde_json::{json, Map, Value};
 use std::collections::{BTreeMap, HashSet};
 use std::fs;
 use std::io::{Read, Write};
@@ -160,6 +160,8 @@ pub enum TaskRuntimeEvent {
     Diagnostic {
         level: DiagnosticLevel,
         message: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        error_info: Option<Value>,
     },
 }
 
@@ -186,6 +188,8 @@ pub struct TaskRunResult {
     pub success: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error_info: Option<Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub code: Option<TaskExitCode>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -196,14 +200,160 @@ pub struct TaskRunResult {
 
 impl TaskRunResult {
     fn failure(error: impl Into<String>) -> Self {
+        let error = error.into();
         Self {
             success: false,
-            error: Some(error.into()),
+            error: Some(error.clone()),
+            error_info: Some(task_error_info(&error, None, None)),
             code: None,
             data: None,
             legacy_result: None,
         }
     }
+}
+
+/// Build the host-side error envelope for failures that happen outside a
+/// provider's own JSON result. Provider errors are still preferred when their
+/// result already contains `errorInfo`; this fallback keeps old providers and
+/// process-launch failures on the same contract.
+fn task_error_info(message: &str, code: Option<&str>, retryable: Option<bool>) -> Value {
+    let lower = message.to_ascii_lowercase();
+    let (inferred_code, category, user_message, recovery, inferred_retryable) =
+        if lower.contains("timed out") || lower.contains("timeout") || lower.contains("超时") {
+            (
+                "TIMEOUT",
+                "network",
+                "网络请求超时",
+                "请检查网络或代理设置，等待后重试。",
+                true,
+            )
+        } else if lower.contains("econn")
+            || lower.contains("connection refused")
+            || lower.contains("connection reset")
+            || lower.contains("network")
+            || lower.contains("网络")
+        {
+            (
+                "NETWORK_ERROR",
+                "network",
+                "网络连接失败",
+                "请检查网络、代理或 DNS 设置后重试。",
+                true,
+            )
+        } else if lower.contains("401")
+            || lower.contains("unauthorized")
+            || lower.contains("未登录")
+            || lower.contains("cookie")
+            || lower.contains("登录")
+        {
+            (
+                "AUTH_REQUIRED",
+                "auth",
+                "登录状态可能已失效",
+                "请重新登录后再重试。",
+                true,
+            )
+        } else if lower.contains("429")
+            || lower.contains("rate limit")
+            || lower.contains("too many")
+            || lower.contains("限流")
+        {
+            (
+                "RATE_LIMITED",
+                "rate_limit",
+                "请求过于频繁，平台暂时限流",
+                "请等待一段时间，调大请求间隔后再继续任务。",
+                true,
+            )
+        } else if lower.contains("403")
+            || lower.contains("forbidden")
+            || lower.contains("permission denied")
+            || lower.contains("无权限")
+        {
+            (
+                "PERMISSION_DENIED",
+                "permission",
+                "当前账号或应用没有访问权限",
+                "请确认账号能访问目标内容，并开通平台要求的权限。",
+                false,
+            )
+        } else if lower.contains("404") || lower.contains("not found") || lower.contains("不存在")
+        {
+            (
+                "NOT_FOUND",
+                "not_found",
+                "目标内容不存在或当前账号不可见",
+                "请在浏览器确认链接有效，并检查当前账号是否仍有访问权限。",
+                false,
+            )
+        } else {
+            (
+                "UNKNOWN_ERROR",
+                "unknown",
+                "任务执行失败",
+                "请查看详细日志，确认输入后重试或提交错误报告。",
+                true,
+            )
+        };
+    let selected_code = code.unwrap_or(inferred_code);
+    let (selected_category, selected_user_message, selected_recovery, selected_retryable) =
+        if selected_code.eq_ignore_ascii_case("PROTOCOL_ERROR") {
+            (
+                "protocol",
+                "任务结果格式不兼容",
+                "请更新插件或重新执行；如果仍失败，请提交错误报告。",
+                false,
+            )
+        } else if selected_code.eq_ignore_ascii_case("TASK_STOPPED") {
+            (
+                "cancelled",
+                "任务已停止",
+                "已完成的内容会保留，可以在任务中心继续任务。",
+                true,
+            )
+        } else {
+            (
+                category,
+                user_message,
+                recovery,
+                retryable.unwrap_or(inferred_retryable),
+            )
+        };
+    let correlation_id = uuid::Uuid::new_v4().simple().to_string();
+    let technical_message = redact_task_error(message);
+    json!({
+        "kind": "wandao.error",
+        "schemaVersion": 1,
+        "code": selected_code,
+        "category": selected_category,
+        "userMessage": selected_user_message,
+        "message": selected_user_message,
+        "recovery": selected_recovery,
+        "retryable": selected_retryable,
+        "correlationId": correlation_id.chars().take(16).collect::<String>(),
+        "technicalMessage": technical_message
+    })
+}
+
+fn redact_task_error(message: &str) -> String {
+    let pattern = regex::Regex::new(
+        r"(?i)(cookie|token|secret|password|authorization|signature|access[_-]?key|api[_-]?key)\s*([:=])\s*[^\s,&;)]+",
+    );
+    match pattern {
+        Ok(pattern) => pattern
+            .replace_all(message, |captures: &regex::Captures<'_>| {
+                format!("{}{}***", &captures[1], &captures[2])
+            })
+            .into_owned(),
+        Err(_) => message.to_string(),
+    }
+}
+
+fn error_info_from_data(data: Option<&Value>) -> Option<Value> {
+    data.and_then(Value::as_object)
+        .and_then(|object| object.get("errorInfo"))
+        .filter(|value| value.is_object())
+        .cloned()
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
@@ -420,6 +570,11 @@ impl TaskRuntime {
                             "无法写入任务初始输入：{}",
                             result.error.unwrap_or_else(|| "未知错误".to_string())
                         ),
+                        error_info: Some(task_error_info(
+                            "无法写入任务初始输入",
+                            Some("TASK_INPUT_WRITE_FAILED"),
+                            Some(true),
+                        )),
                     },
                 );
             }
@@ -574,6 +729,11 @@ impl TaskRuntime {
                                 level: DiagnosticLevel::Error,
                                 message: "任务在停止宽限期内未退出，强制终止失败；可再次尝试停止。"
                                     .to_string(),
+                                error_info: Some(task_error_info(
+                                    "任务在停止宽限期内未退出，强制终止失败；可再次尝试停止。",
+                                    Some("TASK_STOP_FAILED"),
+                                    Some(true),
+                                )),
                             },
                         );
                         emit(&sink, TaskRuntimeEvent::State { state });
@@ -608,6 +768,11 @@ impl TaskRuntime {
                     TaskRuntimeEvent::Diagnostic {
                         level: DiagnosticLevel::Error,
                         message: message.clone(),
+                        error_info: Some(task_error_info(
+                            &message,
+                            Some("TASK_STOP_FAILED"),
+                            Some(true),
+                        )),
                     },
                 );
                 emit(&sink, TaskRuntimeEvent::State { state });
@@ -1132,6 +1297,11 @@ where
                         TaskRuntimeEvent::Diagnostic {
                             level: DiagnosticLevel::Warn,
                             message: format!("任务输出读取失败：{error}"),
+                            error_info: Some(task_error_info(
+                                &format!("任务输出读取失败：{error}"),
+                                Some("TASK_OUTPUT_READ_FAILED"),
+                                Some(true),
+                            )),
                         },
                     );
                     break;
@@ -1293,6 +1463,11 @@ impl StructuredLineDecoder {
                     TaskRuntimeEvent::Diagnostic {
                         level: DiagnosticLevel::Warn,
                         message: "单条结构化任务日志超过 1 MiB，已停止解析该行。".to_string(),
+                        error_info: Some(task_error_info(
+                            "单条结构化任务日志超过 1 MiB，已停止解析该行。",
+                            Some("STRUCTURED_LOG_TOO_LARGE"),
+                            Some(false),
+                        )),
                     },
                 );
             }
@@ -1331,6 +1506,11 @@ impl StructuredLineDecoder {
                 TaskRuntimeEvent::Diagnostic {
                     level: DiagnosticLevel::Warn,
                     message: format!("结构化任务日志无法解析：{error}"),
+                    error_info: Some(task_error_info(
+                        &format!("结构化任务日志无法解析：{error}"),
+                        Some("STRUCTURED_LOG_INVALID"),
+                        Some(false),
+                    )),
                 },
             ),
         }
@@ -1395,13 +1575,15 @@ fn parse_exit_result(
             Ok((data, legacy)) => TaskRunResult {
                 success: true,
                 error: None,
+                error_info: error_info_from_data(Some(&data)),
                 code: None,
                 data: Some(data),
                 legacy_result: Some(legacy),
             },
             Err(error) => TaskRunResult {
                 success: false,
-                error: Some(error),
+                error: Some(error.clone()),
+                error_info: Some(task_error_info(&error, Some("PROTOCOL_ERROR"), Some(false))),
                 code: Some(TaskExitCode::Label("protocol_error".into())),
                 data: None,
                 legacy_result: None,
@@ -1417,11 +1599,15 @@ fn parse_exit_result(
     } else {
         format!("Python exited with code {code}")
     };
+    let data = meaningful_json(parse_last_json(&stdout.text));
+    let error_info = error_info_from_data(data.as_ref())
+        .or_else(|| Some(task_error_info(&error, Some("PROCESS_FAILED"), None)));
     TaskRunResult {
         success: false,
         error: Some(error),
+        error_info,
         code: Some(TaskExitCode::Number(code)),
-        data: meaningful_json(parse_last_json(&stdout.text)),
+        data,
         legacy_result: None,
     }
 }
@@ -1435,6 +1621,11 @@ fn stopped_result(parsed: Option<Value>) -> TaskRunResult {
     TaskRunResult {
         success: false,
         error: Some("任务已由用户停止。".into()),
+        error_info: Some(task_error_info(
+            "任务已由用户停止。",
+            Some("TASK_STOPPED"),
+            Some(true),
+        )),
         code: Some(TaskExitCode::Number(130)),
         data: Some(Value::Object(data)),
         legacy_result: None,
@@ -1996,25 +2187,33 @@ mod tests {
         let first = runtime.request_stop(sink);
         assert!(first.success && first.cooperative && first.stopping);
 
+        let has_force_stop_diagnostic = || {
+            events
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .iter()
+                .any(|event| {
+                    matches!(
+                        event,
+                        TaskRuntimeEvent::Diagnostic {
+                            level: DiagnosticLevel::Error,
+                            message,
+                            ..
+                        } if message.contains("强制终止失败")
+                    )
+                })
+        };
         let deadline = Instant::now() + Duration::from_secs(2);
-        while (calls.load(Ordering::SeqCst) == 0 || runtime.state().stopping)
+        while (calls.load(Ordering::SeqCst) == 0
+            || runtime.state().stopping
+            || !has_force_stop_diagnostic())
             && Instant::now() < deadline
         {
             thread::sleep(Duration::from_millis(5));
         }
         assert_eq!(calls.load(Ordering::SeqCst), 1);
         assert!(!runtime.state().stopping);
-        assert!(events
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .iter()
-            .any(|event| matches!(
-                event,
-                TaskRuntimeEvent::Diagnostic {
-                    level: DiagnosticLevel::Error,
-                    message
-                } if message.contains("强制终止失败")
-            )));
+        assert!(has_force_stop_diagnostic());
 
         let second = runtime.request_stop(Arc::new(|_| {}));
         assert!(second.success && second.cooperative && second.stopping);
