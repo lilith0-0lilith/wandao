@@ -18,10 +18,11 @@ function sourceBetween(start, end, source = appSource) {
   return source.slice(startIndex, endIndex);
 }
 
-test('export sponsor logs only appear for fully completed export actions', () => {
+test('export sponsor logs appear for completed exports and partial exports at or above 90%', () => {
   const logs = [];
   const context = {
     FLUXION_REGISTER_URL: 'https://fluxionai.space/register?source=github&campaign=wandao',
+    FLUXION_EXPORT_SUCCESS_MESSAGE: '完成导出啦！送你一个 3 美元兑换码，用于 AI 辅助学习。',
     FLUXION_REDEEM_MESSAGE: '兑换码：WANNENGDAO — 登录后在工作台「兑换」输入，即可获得 $3 API 额度。',
     appendUserLog: (message, type, presentation) => logs.push({ message, type, presentation })
   };
@@ -30,19 +31,49 @@ test('export sponsor logs only appear for fully completed export actions', () =>
     'globalThis.__append = appendExportSuccessSponsorLogs;'
   ].join('\n'), context);
 
-  for (const outcome of ['partial', 'paused', 'stopped', 'failed']) {
-    context.__append(outcome, '导出');
-  }
+  context.__append('partial', '导出', { stats: { imageSuccess: 8, imageFailed: 2 } });
+  assert.equal(logs.length, 0);
+  context.__append('partial', '导出', { stats: { imageSuccess: 9, imageFailed: 1 } });
+  assert.deepEqual(logs.map((entry) => entry.presentation), ['fluxion-export-success', 'fluxion-register', 'fluxion-redeem']);
+  logs.length = 0;
+  for (const outcome of ['paused', 'stopped', 'failed']) context.__append(outcome, '导出');
   for (const action of ['导入', '登录', '读取目录', 'upload']) {
     context.__append('completed', action);
   }
   assert.equal(logs.length, 0);
 
   context.__append('completed', '导出');
-  assert.deepEqual(logs.map((entry) => entry.presentation), ['fluxion-register', 'fluxion-redeem']);
+  assert.equal(logs.length, 3);
   logs.length = 0;
   context.__append('completed', { kind: 'export', actionName: '执行导出' });
-  assert.equal(logs.length, 2);
+  assert.equal(logs.length, 3);
+  assert.match(logs[0].message, /完成导出啦/);
+});
+
+test('resource recovery logs always include the failed page and resource link', () => {
+  const logs = [];
+  const context = {
+    appendUserLog: (message, type, presentation) => logs.push({ message, type, presentation })
+  };
+  vm.runInNewContext([
+    sourceBetween('function isExportAction(action) {', '\nfunction compactLogSummary('),
+    'globalThis.__resource = appendExportResourceRecoveryLog;'
+  ].join('\n'), context);
+  const report = {
+    stats: { imageSuccess: 9, imageFailed: 1 },
+    documentFailures: [],
+    resourceFailures: [{ document: '第二页', url: 'https://cdn.example.test/image.png', error: '404' }]
+  };
+
+  context.__resource('partial', '导出', report);
+  assert.match(logs[0].message, /网络波动或资源不存在/);
+  assert.match(logs[0].message, /第二页/);
+  assert.match(logs[0].message, /https:\/\/cdn\.example\.test\/image\.png/);
+  logs.length = 0;
+  context.__resource('partial', '导出', report, true);
+  assert.match(logs[0].message, /重试后仍有/);
+  assert.match(logs[0].message, /第二页/);
+  assert.equal(logs[0].type, 'warn');
 });
 
 test('all export completion entry points place sponsor logs before structured details and the final outcome', () => {
@@ -78,6 +109,7 @@ test('sponsor content is a dedicated notice category instead of a footer on ever
   assert.match(sponsorArticle, /WANNENGDAO/);
   assert.match(appSource, /presentation === 'fluxion-register'/);
   assert.match(appSource, /presentation === 'fluxion-redeem'/);
+  assert.match(appSource, /presentation === 'fluxion-export-success'/);
   assert.match(stylesSource, /\.log-entry \.log-external-link\s*\{/);
 });
 

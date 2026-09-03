@@ -14,6 +14,7 @@ const GITHUB_RAW_BASE = 'https://raw.githubusercontent.com/tllovesxs/wandao/main
 const GITHUB_BLOB_BASE = 'https://github.com/tllovesxs/wandao/blob/main/';
 const NOTICE_CENTER_MANIFEST_URL = `${GITHUB_RAW_BASE}docs/tutorial-announcements.json`;
 const FLUXION_REGISTER_URL = 'https://fluxionai.space/register?source=github&campaign=wandao';
+const FLUXION_EXPORT_SUCCESS_MESSAGE = '完成导出啦！送你一个 3 美元兑换码，用于 AI 辅助学习。';
 const FLUXION_REDEEM_MESSAGE = '兑换码：WANNENGDAO — 登录后在工作台「兑换」输入，即可获得 $3 API 额度。';
 const DEFAULT_BROWSER_DOWNLOAD_URL = 'https://www.google.com/chrome/';
 let pluginCatalogState = { status: 'idle', plugins: [], query: '', error: '', offline: false, experimentalError: '', updatedAt: '' };
@@ -848,14 +849,78 @@ function isExportAction(action) {
     || String(action || '').trim() === '导出';
 }
 
-function appendExportSuccessSponsorLogs(outcome, action) {
-  if (outcome !== 'completed' || !isExportAction(action)) return;
+function exportCompletionRate(report = {}) {
+  const stats = report?.stats || report || {};
+  const number = (value) => {
+    const parsed = Number(value);
+    return Number.isFinite(parsed) && parsed >= 0 ? parsed : 0;
+  };
+  const resourceSuccess = number(stats.imageSuccess) + number(stats.attachmentSuccess);
+  const resourceFailed = number(stats.imageFailed) + number(stats.attachmentFailed);
+  const resourceTotal = resourceSuccess + resourceFailed;
+  if (resourceTotal > 0) return resourceSuccess / resourceTotal;
+
+  const failed = number(stats.failed);
+  const completed = Math.max(
+    number(stats.success),
+    number(stats.exported),
+    number(stats.imported),
+    number(stats.created) + number(stats.updated),
+    number(stats.skipped)
+  );
+  const total = Math.max(number(stats.total), completed + failed);
+  return total > 0 ? completed / total : 0;
+}
+
+function shouldShowExportSuccessSponsor(outcome, report = {}) {
+  return outcome === 'completed' || (outcome === 'partial' && exportCompletionRate(report) >= 0.9);
+}
+
+function appendExportSuccessSponsorLogs(outcome, action, report = {}) {
+  if (!shouldShowExportSuccessSponsor(outcome, report) || !isExportAction(action)) return;
+  appendUserLog(FLUXION_EXPORT_SUCCESS_MESSAGE, 'success', 'fluxion-export-success');
   appendUserLog(FLUXION_REGISTER_URL, 'success', 'fluxion-register');
   appendUserLog(FLUXION_REDEEM_MESSAGE, 'success', 'fluxion-redeem');
 }
 
+function appendExportResourceRecoveryLog(outcome, action, report = {}, retryingFailures = false) {
+  if (!isExportAction(action) || outcome !== 'partial') return;
+  const stats = report?.stats || {};
+  const resourceFailures = Array.isArray(report?.resourceFailures) ? report.resourceFailures : [];
+  const documentFailures = Array.isArray(report?.documentFailures) ? report.documentFailures : [];
+  if (!resourceFailures.length) return;
+  const isResourceOnlyPartial = !documentFailures.length && Number(stats.failed || 0) <= 0;
+  const isHighCompletionPartial = isResourceOnlyPartial && exportCompletionRate(report) >= 0.9;
+
+  const value = (item, keys) => {
+    for (const key of keys) {
+      const text = String(item?.[key] ?? '').replace(/\s+/g, ' ').trim();
+      if (text) return text;
+    }
+    return '';
+  };
+  const lines = resourceFailures.map((item, index) => {
+    const page = value(item, ['document', 'documentTitle', 'page', 'relativePath', 'path', 'title', 'docId', 'nodeId']) || '未返回页面信息';
+    const link = value(item, ['url', 'href', 'src', 'source', 'target', 'file', 'resource']) || '未返回资源链接';
+    const reason = value(item, ['error', 'reason', 'message', 'code']);
+    return `${index + 1}. 页面：${page}；资源：${link}${reason ? `；原因：${reason}` : ''}`;
+  });
+  const headline = retryingFailures
+    ? `重试后仍有 ${resourceFailures.length} 个资源未导出，请确认资源本身是否不可导出：`
+    : (isHighCompletionPartial
+      ? '由于网络波动或资源不存在，部分资源未导出；如影响阅读效果，可以点击“重试失败项”再次尝试。'
+      : `本次导出有 ${resourceFailures.length} 个资源未导出，以下是失败资源明细：`);
+  appendUserLog(
+    `${headline}${isHighCompletionPartial || retryingFailures ? '\n失败资源明细：' : ''}\n${lines.join('\n')}`,
+    'warn',
+    'export-resource-recovery'
+  );
+}
+
 function isSponsorLogEntry(entry) {
-  return entry?.presentation === 'fluxion-register' || entry?.presentation === 'fluxion-redeem';
+  return entry?.presentation === 'fluxion-export-success'
+    || entry?.presentation === 'fluxion-register'
+    || entry?.presentation === 'fluxion-redeem';
 }
 
 function compactLogSummary(message, maxLength = 220) {
@@ -1739,6 +1804,9 @@ function taskHistoryDetailsHtml(task) {
   const documentFailures = Array.isArray(report.documentFailures) ? report.documentFailures : [];
   const imageFailures = Array.isArray(report.imageFailures) ? report.imageFailures : [];
   const attachmentFailures = Array.isArray(report.attachmentFailures) ? report.attachmentFailures : [];
+  const otherResourceFailures = Array.isArray(report.resourceFailures)
+    ? report.resourceFailures.filter((item) => !['image', 'attachment'].includes(String(item?.type || item?.kind || '').toLowerCase()))
+    : [];
   const errorInfo = report.errorInfo || task.errorInfo || null;
   const failurePreview = taskFailureDiagnostics(task, 12);
   const canResume = canResumeTask(task);
@@ -1752,7 +1820,8 @@ function taskHistoryDetailsHtml(task) {
         ${renderTaskFailureDetails('文档失败', documentFailures, 'document')}
         ${renderTaskFailureDetails('图片失败', imageFailures, 'image')}
         ${renderTaskFailureDetails('附件失败', attachmentFailures, 'attachment')}
-        ${!documentFailures.length && !imageFailures.length && !attachmentFailures.length && failurePreview.length ? `
+        ${renderTaskFailureDetails('其他资源失败', otherResourceFailures, 'resource')}
+        ${!documentFailures.length && !imageFailures.length && !attachmentFailures.length && !otherResourceFailures.length && failurePreview.length ? `
           <section class="task-history-detail-block">
             <h4>关键失败摘要</h4>
             <ul>${failurePreview.map((line) => `<li>${escapeHtml(line)}</li>`).join('')}</ul>
@@ -2187,7 +2256,13 @@ async function resumeTask(task) {
     });
     const outcome = taskResultStatus(result, { provider: task.providerId, mode: task.action });
     if ((outcome === 'completed' || outcome === 'partial' || outcome === 'paused') && !isStoppedResult(result)) {
-      appendExportSuccessSponsorLogs(outcome, task.action);
+      appendExportSuccessSponsorLogs(outcome, task.action, taskReportForResult(result, { provider: task.providerId, mode: task.action }));
+      appendExportResourceRecoveryLog(
+        outcome,
+        task.action,
+        taskReportForResult(result, { provider: task.providerId, mode: task.action }),
+        retryingFailures
+      );
       if (result.data) log(JSON.stringify(result.data, null, 2), 'info');
       finishProgressForTaskResult(result, '历史任务继续执行完成', { provider: task.providerId, mode: task.action });
       logTaskResultCompletion(result, '历史任务继续执行完成', { provider: task.providerId, mode: task.action });
@@ -5023,7 +5098,8 @@ function initializeManifestProviderHandlers(provider, actions, fields) {
         } else if (result.success) {
           const actionMode = action.actionName || action.label || '执行';
           const outcome = taskResultStatus(result, { provider: provider.id, mode: actionMode });
-          appendExportSuccessSponsorLogs(outcome, action);
+          appendExportSuccessSponsorLogs(outcome, action, taskReportForResult(result, { provider: provider.id, mode: actionMode }));
+          appendExportResourceRecoveryLog(outcome, action, taskReportForResult(result, { provider: provider.id, mode: actionMode }));
           if (result.data) log(JSON.stringify(result.data, null, 2), 'info');
           applyActionUpdates(provider, action, result.data || {});
           if (action.kind === 'scan' || action.scanToc || action.id === 'scan') {
@@ -7182,7 +7258,8 @@ async function handleExport(toolId) {
       finishProgress('stopped', `${actionName}已停止`);
     } else if (result.success) {
       const outcome = taskResultStatus(result, { provider: toolId, mode: actionName });
-      appendExportSuccessSponsorLogs(outcome, actionName);
+      appendExportSuccessSponsorLogs(outcome, actionName, taskReportForResult(result, { provider: toolId, mode: actionName }));
+      appendExportResourceRecoveryLog(outcome, actionName, taskReportForResult(result, { provider: toolId, mode: actionName }));
       if (result.data) {
         log(JSON.stringify(result.data, null, 2), 'info');
       }

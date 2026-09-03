@@ -201,6 +201,7 @@ test('resource failures are retried when the provider supports failed-item retry
   assert.match(resumeTaskHandler, /const retryableFailures = taskFailureCount\(task\)/);
   assert.match(resumeTaskHandler, /失败项，共 \$\{retryableFailures\} 个/);
   assert.match(taskDetails, /renderTaskFailureDetails\('图片失败', imageFailures, 'image'\)/);
+  assert.match(taskDetails, /renderTaskFailureDetails\('其他资源失败', otherResourceFailures, 'resource'\)/);
   assert.match(taskDetails, /task-history-recovery/);
   assert.doesNotMatch(taskDetails, /不会把它们误作“失败文档”自动重试/);
 });

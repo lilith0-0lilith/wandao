@@ -1983,6 +1983,16 @@ def export_wiz(args: argparse.Namespace) -> dict[str, Any]:
         docs = select_wiz_documents(docs, selected_ids)
         planner = PathPlanner(output)
         doc_paths = {doc.doc_guid: planner.markdown_path(doc) for doc in docs}
+        # A checkpoint can recover an abandoned task by changing its old
+        # ``failed`` items to ``pending`` when we claim the new run.  Snapshot
+        # the explicit retry set before that recovery so legacy exports with a
+        # fully-written Markdown file (but failed images) can still be
+        # migrated to completed without re-exporting the document.
+        retry_failed_item_keys = (
+            {str(item["item_key"]) for item in checkpoint.failed_items()}
+            if checkpoint and getattr(args, "retry_failed", False)
+            else set()
+        )
         if checkpoint:
             checkpoint.start_task(
                 {
@@ -2006,7 +2016,7 @@ def export_wiz(args: argparse.Namespace) -> dict[str, Any]:
                 retry_docs: list[WizDoc] = []
                 for doc in docs:
                     item_key = f"wiz:doc:{doc.doc_guid}"
-                    if checkpoint.item_status(item_key) != "failed":
+                    if item_key not in retry_failed_item_keys:
                         continue
                     md_path = doc_paths[doc.doc_guid]
                     if md_path.is_file():
