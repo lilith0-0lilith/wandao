@@ -1,5 +1,10 @@
 # Wandao Release Notes
 
+## 1.4.7
+
+- 修复 Tauri 发行包遗漏 `plugins` 根目录公共资源的问题，确保 Windows/macOS 安装包与源码资源布局一致。
+- 延续 1.4.6 的导出失败资源页面、链接、失败日志与任务中心查看能力。
+
 ## 1.4.6
 
 - 合入 Google Docs 单篇文档 Markdown 导出插件，支持从插件中心安装和更新。
