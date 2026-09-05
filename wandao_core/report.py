@@ -77,12 +77,39 @@ _RESOURCE_REFERENCE_KEYS = (
 )
 _RESOURCE_DOCUMENT_KEYS = (
     "document",
+    "documentTitle",
     "relativePath",
     "path",
     "title",
     "docId",
     "nodeId",
     "itemKey",
+)
+_RESOURCE_PAGE_KEYS = (
+    "documentUrl",
+    "pageUrl",
+    "sourceUrl",
+    "documentHref",
+)
+_RESOURCE_PAGE_KIND_KEYS = (
+    "documentUrlKind",
+    "pageUrlKind",
+    "sourceUrlKind",
+    "documentHrefKind",
+)
+_RESOURCE_PAGE_LABEL_KEYS = (
+    "documentUrlLabel",
+    "pageUrlLabel",
+    "sourceUrlLabel",
+    "documentHrefLabel",
+)
+_RESOURCE_LOCATION_KEYS = ("documentId", "knowledgeBaseId")
+_RESOURCE_CONTEXT_KEYS = (
+    *_RESOURCE_DOCUMENT_KEYS,
+    *_RESOURCE_PAGE_KEYS,
+    *_RESOURCE_PAGE_KIND_KEYS,
+    *_RESOURCE_PAGE_LABEL_KEYS,
+    *_RESOURCE_LOCATION_KEYS,
 )
 _RESOURCE_ERROR_KEYS = ("error", "reason", "message", "status", "code", "warning")
 _RESOURCE_CONTAINER_KEYS = ("failures", "warnings", "items", "resources", "entries")
@@ -188,7 +215,7 @@ def resource_failures(report: dict[str, Any]) -> list[dict[str, Any]]:
 
     def add(value: dict[str, Any], inherited_kind: str, inherited_context: dict[str, Any]) -> None:
         context = dict(inherited_context)
-        for key in _RESOURCE_DOCUMENT_KEYS:
+        for key in _RESOURCE_CONTEXT_KEYS:
             if key not in context and value.get(key) is not None:
                 context[key] = value[key]
         kind = _resource_kind_from_item(value, inherited_kind)
@@ -221,7 +248,7 @@ def resource_failures(report: dict[str, Any]) -> list[dict[str, Any]]:
 
         kind = _resource_kind_from_item(value, inherited_kind)
         context = dict(inherited_context)
-        for key in _RESOURCE_DOCUMENT_KEYS:
+        for key in _RESOURCE_CONTEXT_KEYS:
             if key not in context and value.get(key) is not None:
                 context[key] = value[key]
         has_children = False
@@ -452,7 +479,7 @@ def _iter_named_values(
     if identity in seen:
         return
     seen.add(identity)
-    for key in _RESOURCE_DOCUMENT_KEYS:
+    for key in _RESOURCE_CONTEXT_KEYS:
         if key not in context and value.get(key) is not None:
             context[key] = value[key]
     for key, child in value.items():

@@ -66,6 +66,7 @@ from wandao_core.browser import (
 from wandao_core.checkpoint import add_checkpoint_args, open_checkpoint_from_args
 from wandao_cli import extend_arg_list_from_file
 from wandao_core.credentials import write_private_json
+from wandao_core.document_links import direct_document_reference
 from wandao_core.report import finalize_report
 
 
@@ -1168,6 +1169,7 @@ def export_book(args: argparse.Namespace) -> dict[str, Any]:
                 emit(args, "收到停止请求，正在结束并写入已完成的导出结果。", event="task.stopped", level="warn")
                 break
             key = str(doc.get("doc_id") or doc["uuid"])
+            source_url = f"{book_url.rstrip('/')}/{doc['url']}" if doc.get("url") else ""
             md_path = doc_paths[key]
             item_key = checkpoint_key(doc)
             if checkpoint and getattr(args, "resume", False) and not args.update_existing and checkpoint.item_status(item_key) == "completed":
@@ -1185,11 +1187,10 @@ def export_book(args: argparse.Namespace) -> dict[str, Any]:
                     args,
                     f"开始导出语雀文档：{doc.get('title') or key}",
                     event="document.export.started",
-                    doc={"id": key, "title": doc.get("title") or "", "index": index, "path": str(md_path)},
+                    doc={"id": key, "title": doc.get("title") or "", "index": index, "path": str(md_path), **direct_document_reference(source_url, document_id=key)},
                 )
                 result = fetch_doc_markdown(cdp, int(book["id"]), doc, args)
                 markdown = result.get("markdown") or f"# {doc.get('title') or '未命名'}\n"
-                source_url = f"{book_url.rstrip('/')}/{doc.get('url')}"
                 if getattr(args, "include_source", True):
                     markdown += (
                         f"\n---\n\n来源: {source_url}\n"
@@ -1219,7 +1220,7 @@ def export_book(args: argparse.Namespace) -> dict[str, Any]:
                         message,
                         event=event,
                         level=level,
-                        doc={"id": key, "title": doc.get("title") or "", "index": index, "path": str(md_path)},
+                        doc={"id": key, "title": doc.get("title") or "", "index": index, "path": str(md_path), **direct_document_reference(source_url, document_id=key)},
                         resource={
                             "type": progress["kind"],
                             "url": progress["url"],
@@ -1245,7 +1246,12 @@ def export_book(args: argparse.Namespace) -> dict[str, Any]:
                 image_success += resource_counts.get("image", 0)
                 attachment_success += resource_counts.get("attachment", 0)
                 if resource_errors:
-                    resource_failures.append({"document": doc.get("title"), "path": str(md_path), "failures": resource_errors})
+                    resource_failures.append({
+                        "document": doc.get("title"),
+                        "path": str(md_path),
+                        "failures": resource_errors,
+                        **direct_document_reference(source_url, document_id=key),
+                    })
                 md_path.parent.mkdir(parents=True, exist_ok=True)
                 md_path.write_text(markdown, encoding="utf-8")
                 if checkpoint:
@@ -1258,7 +1264,7 @@ def export_book(args: argparse.Namespace) -> dict[str, Any]:
                     args,
                     f"语雀文档导出完成：{doc.get('title') or key}",
                     event="document.export.completed",
-                    doc={"id": key, "title": doc.get("title") or "", "index": index, "path": str(md_path)},
+                    doc={"id": key, "title": doc.get("title") or "", "index": index, "path": str(md_path), **direct_document_reference(source_url, document_id=key)},
                     stats={
                         "imageSuccessInDoc": resource_counts.get("image", 0),
                         "attachmentSuccessInDoc": resource_counts.get("attachment", 0),
@@ -1274,13 +1280,13 @@ def export_book(args: argparse.Namespace) -> dict[str, Any]:
             except Exception as exc:
                 if checkpoint:
                     checkpoint.fail_item(item_key, str(exc))
-                failures.append({"title": doc.get("title") or "", "slug": doc.get("url") or "", "error": str(exc)})
+                failures.append({"title": doc.get("title") or "", "slug": doc.get("url") or "", "error": str(exc), **direct_document_reference(source_url, document_id=key)})
                 emit(
                     args,
                     f"语雀文档导出失败：{doc.get('title') or key}：{exc}",
                     event="document.export.failed",
                     level="error",
-                    doc={"id": key, "title": doc.get("title") or "", "index": index, "path": str(md_path)},
+                    doc={"id": key, "title": doc.get("title") or "", "index": index, "path": str(md_path), **direct_document_reference(source_url, document_id=key)},
                     error={"type": type(exc).__name__, "message": str(exc)},
                 )
 

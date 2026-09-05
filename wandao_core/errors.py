@@ -66,20 +66,26 @@ _RULES: tuple[tuple[str, str, str, str, bool, re.Pattern[str]], ...] = (
         re.compile(r"HTTP\s+403|forbidden|permission denied|access denied|无权限|权限不足|拒绝访问", re.IGNORECASE),
     ),
     (
+        "RESOURCE_DOWNLOAD_FAILED",
+        "resource",
+        "图片或附件处理失败",
+        "正文可能已完成；可以在任务中心单独重试失败资源。",
+        True,
+        re.compile(
+            r"图片下载失败|附件下载失败|下载.*(?:图片|附件|image|attachment)"
+            r"|(?:图片|附件|资源).{0,40}(?:HTTP\s+40[134]|响应|下载失败|上传失败|处理失败|失败|错误)"
+            r"|(?:image|attachment|resource).{0,40}(?:HTTP\s+40[134]|response|download|upload|fail|error)"
+            r"|上传附件失败",
+            re.IGNORECASE,
+        ),
+    ),
+    (
         "NOT_FOUND",
         "not_found",
         "目标内容不存在或当前账号不可见",
         "请在浏览器确认链接有效，并检查当前账号是否仍有访问权限。",
         False,
         re.compile(r"HTTP\s+404|not found|不存在|已删除|无效.*链接", re.IGNORECASE),
-    ),
-    (
-        "RESOURCE_DOWNLOAD_FAILED",
-        "resource",
-        "图片或附件处理失败",
-        "正文可能已完成；可以在任务中心单独重试失败资源。",
-        True,
-        re.compile(r"图片|附件|image|attachment|resource.*(fail|error)|下载失败|上传附件失败", re.IGNORECASE),
     ),
     (
         "BROWSER_UNAVAILABLE",

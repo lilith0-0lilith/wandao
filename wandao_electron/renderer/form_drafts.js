@@ -40,7 +40,6 @@
       field.name,
       field.autocomplete,
       field.ariaLabel,
-      field.placeholder,
       attribute('aria-label'),
       attribute('data-draft-key')
     ].map((value) => String(value || '')).join(' ');

@@ -198,14 +198,17 @@ let appSettingsState = {
   browserDetectError: '',
   browserDownloadUrl: DEFAULT_BROWSER_DOWNLOAD_URL
 };
-const MAX_LOG_ENTRIES = 2000;
+// Keep enough history for long batch exports; the panel still renders in
+// bounded pages so retaining history does not make the UI sluggish.
+const MAX_LOG_ENTRIES = 10000;
 const LOG_PANEL_RENDER_LIMIT = 400;
 const LOG_INLINE_PREVIEW_LIMIT = 640;
-const MAX_TASK_LOG_ENTRIES = 2000;
+const MAX_TASK_LOG_ENTRIES = 10000;
 const userLogEntries = [];
 const detailLogEntries = [];
 let activeTaskLogEntries = [];
 let logViewMode = localStorage.getItem('wandao-log-view') === 'detail' ? 'detail' : 'user';
+let logPanelRenderCount = LOG_PANEL_RENDER_LIMIT;
 const MAX_TASK_HISTORY = 80;
 const TASK_HISTORY_RENDER_LIMIT = 20;
 let taskHistory = [];
@@ -323,6 +326,75 @@ function restoreFormDraftForProvider(providerId) {
   return restored;
 }
 
+function activeTaskForProvider(providerId) {
+  const candidates = [];
+  if (activeHistoryTask) candidates.push(activeHistoryTask);
+  const runningTaskId = String(mainPythonProcessState?.taskId || '').trim();
+  if (runningTaskId) {
+    const recoveredTask = taskHistory.find((task) => task.id === runningTaskId);
+    if (recoveredTask) candidates.push(recoveredTask);
+  }
+  return candidates.find((task) => (
+    task?.providerId === providerId
+    && ['running', 'stopping'].includes(String(task.status || '').toLowerCase())
+    && Array.isArray(task.args)
+  )) || null;
+}
+
+function taskArgValue(args, parameter) {
+  const option = String(parameter || '').trim();
+  if (!option) return '';
+  const values = Array.isArray(args) ? args : [];
+  const inlinePrefix = `${option}=`;
+  const inline = values.find((arg) => String(arg).startsWith(inlinePrefix));
+  if (inline) return String(inline).slice(inlinePrefix.length).trim();
+  const index = values.findIndex((arg) => String(arg) === option);
+  if (index < 0 || index + 1 >= values.length) return '';
+  const value = String(values[index + 1] || '').trim();
+  return value.startsWith('--') ? '' : value;
+}
+
+function providerFieldElement(provider, field) {
+  const manifestElement = document.getElementById(manifestFieldId(provider, field));
+  if (manifestElement) return manifestElement;
+  const key = String(field?.name || '').trim();
+  if (!key) return null;
+  const root = formDraftRoot();
+  const fields = root?.querySelectorAll?.('input, textarea, select') || [];
+  return Array.from(fields).find((element) => (
+    String(element.getAttribute?.('data-history-key') || '') === key
+    || String(element.id || '') === `${provider.id}-${key}`
+  )) || null;
+}
+
+function restoreActiveTaskFormValues(provider) {
+  if (!provider || currentTool !== provider.id) return 0;
+  const task = activeTaskForProvider(provider.id);
+  if (!task) return 0;
+  let restored = 0;
+  const setIfEmpty = (element, value) => {
+    if (!element || !value || String(element.value || '').trim()) return;
+    element.value = value;
+    restored += 1;
+  };
+  if (Array.isArray(provider.fields) && provider.fields.length) {
+    for (const field of provider.fields) {
+      if (field.type === 'notice' || field.type === 'checkbox') continue;
+      const value = taskArgValue(task.args, field.arg);
+      if (value) setIfEmpty(providerFieldElement(provider, field), value);
+    }
+  } else {
+    if (!provider.noUrl) {
+      setIfEmpty(document.getElementById(`${provider.id}-url`), taskArgValue(task.args, provider.urlParam));
+    }
+    setIfEmpty(document.getElementById(`${provider.id}-output`), taskArgValue(task.args, provider.outputParam));
+  }
+  if (restored > 0) {
+    log('已恢复正在运行任务的目标参数。', 'info');
+  }
+  return restored;
+}
+
 function activateFormDraftAction(providerId, actionId = 'default') {
   if (!FORM_DRAFTS || currentTool !== providerId) return { restored: 0, actionId: '' };
   saveCurrentFormDraft();
@@ -396,7 +468,7 @@ const ERROR_RULES = [
   },
   {
     category: '图片或附件下载失败',
-    pattern: /(图片下载失败|附件下载失败|download.*image|image.*download|tcs-devops\.aliyuncs\.com|cdn\.nlark\.com|图片.*HTTP 40[134]|HTTP 40[134].*图片|imageFailure|imageFailures)/i,
+    pattern: /(图片下载失败|附件下载失败|download.*(?:image|attachment)|(?:图片|附件|资源).{0,40}(?:HTTP 40[134]|响应|下载失败|上传失败|处理失败|失败|错误)|(?:image|attachment|resource).{0,40}(?:HTTP 40[134]|response|download|upload|fail|error)|tcs-devops\.aliyuncs\.com|cdn\.nlark\.com|imageFailure|imageFailures|上传附件失败)/i,
     title: '图片或附件处理失败',
     suggestion: '正文可能已导出，但这些图片没有成功本地化。请检查网络、重新登录后重试，或确认原文图片在浏览器中可以打开。'
   },
@@ -664,12 +736,13 @@ function trimLogStore(entries) {
 }
 
 function visibleLogEntries(entries) {
-  if (entries.length <= LOG_PANEL_RENDER_LIMIT) {
+  const limit = Math.max(LOG_PANEL_RENDER_LIMIT, logPanelRenderCount);
+  if (entries.length <= limit) {
     return { entries, omitted: 0 };
   }
   return {
-    entries: entries.slice(entries.length - LOG_PANEL_RENDER_LIMIT),
-    omitted: entries.length - LOG_PANEL_RENDER_LIMIT
+    entries: entries.slice(entries.length - limit),
+    omitted: entries.length - limit
   };
 }
 
@@ -714,6 +787,60 @@ function formatLogTime(value) {
   return formatUserDateTime(value);
 }
 
+function isSafeExternalHttpUrl(value) {
+  const text = String(value || '').trim();
+  if (!/^https?:\/\//i.test(text)) return false;
+  if (typeof URL === 'function') {
+    try {
+      const parsed = new URL(text);
+      return parsed.protocol === 'http:' || parsed.protocol === 'https:';
+    } catch {
+      return false;
+    }
+  }
+  // Keep stripped-down test hosts and older embedded runtimes safe too.
+  return /^https?:\/\/[^\s<>"'`]+$/i.test(text);
+}
+
+function createLogExternalLink(url) {
+  const link = document.createElement('a');
+  link.className = 'log-external-link';
+  link.href = url;
+  link.textContent = url;
+  link.rel = 'noreferrer noopener';
+  link.addEventListener('click', (event) => {
+    event.preventDefault();
+    if (typeof window.electronAPI?.openExternal === 'function') {
+      window.electronAPI.openExternal(url);
+    }
+  });
+  return link;
+}
+
+function appendResourceRecoveryMessage(parent, message) {
+  const text = String(message || '');
+  // Resource recovery messages use Markdown links in copied reports. Parse
+  // that small, fixed subset here so the in-app log keeps meaningful labels.
+  const urlPattern = /\[([^\]\r\n]+)\]\((https?:\/\/[^\s<>"'`，。；;（）(){}\[\]]+)\)|(https?:\/\/[^\s<>"'`，。；;（）(){}\[\]]+)/gi;
+  let cursor = 0;
+  let match;
+  while ((match = urlPattern.exec(text))) {
+    const url = match[2] || match[3];
+    const label = match[1] || url;
+    const start = match.index;
+    if (start > cursor) parent.appendChild(document.createTextNode(text.slice(cursor, start)));
+    if (isSafeExternalHttpUrl(url)) {
+      const link = createLogExternalLink(url);
+      link.textContent = label;
+      parent.appendChild(link);
+    } else {
+      parent.appendChild(document.createTextNode(match[0]));
+    }
+    cursor = start + match[0].length;
+  }
+  if (cursor < text.length) parent.appendChild(document.createTextNode(text.slice(cursor)));
+}
+
 function createLogEntryElement(message, type = 'info', time = new Date().toISOString(), presentation = '') {
   const entry = document.createElement('div');
   entry.className = `log-entry ${type}`;
@@ -749,11 +876,19 @@ function createLogEntryElement(message, type = 'info', time = new Date().toISOSt
       summary.textContent = `查看完整内容（${text.length} 字）`;
       const full = document.createElement('pre');
       full.className = 'log-entry-full';
-      full.textContent = text;
+      if (presentation === 'export-resource-recovery') {
+        appendResourceRecoveryMessage(full, text);
+      } else {
+        full.textContent = text;
+      }
       details.append(summary, full);
       entry.append(preview, details);
     } else {
-      entry.appendChild(document.createTextNode(text));
+      if (presentation === 'export-resource-recovery') {
+        appendResourceRecoveryMessage(entry, text);
+      } else {
+        entry.appendChild(document.createTextNode(text));
+      }
     }
   }
   return entry;
@@ -767,17 +902,21 @@ function createLogNoticeElement(message) {
 }
 
 function trimRenderedLogEntries(logContent) {
-  while (logContent.children.length > LOG_PANEL_RENDER_LIMIT) {
+  while (logContent.children.length > logPanelRenderCount) {
     logContent.removeChild(logContent.firstElementChild);
   }
 }
 
 function renderLogEntry(message, type = 'info', time = new Date().toISOString(), presentation = '') {
   const logContent = document.getElementById('log-content');
-  if (!logContent) return;
+  if (!logContent) {
+    syncLoadEarlierLogControl();
+    return;
+  }
   logContent.appendChild(createLogEntryElement(message, type, time, presentation));
   trimRenderedLogEntries(logContent);
   logContent.scrollTop = logContent.scrollHeight;
+  syncLoadEarlierLogControl();
 }
 
 function renderUserLogEntry(entry) {
@@ -797,16 +936,36 @@ function updateLogViewHeader() {
   if (button) button.textContent = logViewMode === 'detail' ? '用户日志' : '详细日志';
 }
 
-function renderLogPanel() {
+function updateLoadEarlierLogControl(omitted) {
+  const button = document.getElementById('btn-load-earlier-log');
+  if (!button) return;
+  button.hidden = omitted <= 0;
+  if (omitted > 0) {
+    button.textContent = `加载更早（${Math.min(LOG_PANEL_RENDER_LIMIT, omitted)} 条）`;
+  }
+}
+
+function syncLoadEarlierLogControl() {
+  const entries = logViewMode === 'detail' ? detailLogEntries : userLogEntries;
+  const logContent = document.getElementById('log-content');
+  const renderedEntryCount = logContent
+    ? Array.from(logContent.children).filter((child) => !child.classList.contains('muted')).length
+    : 0;
+  const omitted = Math.max(0, entries.length - Math.max(logPanelRenderCount, renderedEntryCount));
+  updateLoadEarlierLogControl(omitted);
+}
+
+function renderLogPanel(scrollToEnd = true) {
   updateLogViewHeader();
   const logContent = document.getElementById('log-content');
   if (!logContent) return;
   logContent.replaceChildren();
   const allEntries = logViewMode === 'detail' ? detailLogEntries : userLogEntries;
   const { entries, omitted } = visibleLogEntries(allEntries);
+  updateLoadEarlierLogControl(omitted);
   const fragment = document.createDocumentFragment();
   if (omitted > 0) {
-    fragment.appendChild(createLogNoticeElement(`为保持界面流畅，仅显示最近 ${LOG_PANEL_RENDER_LIMIT} 条日志；完整日志仍会进入错误报告。`));
+    fragment.appendChild(createLogNoticeElement(`为保持界面流畅，当前已加载最近 ${entries.length} 条日志；可点击“加载更早”继续查看。`));
   }
   entries.forEach((entry) => {
     if (logViewMode === 'detail') {
@@ -818,7 +977,14 @@ function renderLogPanel() {
     }
   });
   logContent.appendChild(fragment);
-  logContent.scrollTop = logContent.scrollHeight;
+  logContent.scrollTop = scrollToEnd ? logContent.scrollHeight : 0;
+}
+
+function loadEarlierLogEntries() {
+  const entries = logViewMode === 'detail' ? detailLogEntries : userLogEntries;
+  if (logPanelRenderCount >= entries.length) return;
+  logPanelRenderCount = Math.min(entries.length, logPanelRenderCount + LOG_PANEL_RENDER_LIMIT);
+  renderLogPanel(false);
 }
 
 function toggleLogViewMode() {
@@ -901,9 +1067,28 @@ function appendExportResourceRecoveryLog(outcome, action, report = {}, retryingF
   };
   const lines = resourceFailures.map((item, index) => {
     const page = value(item, ['document', 'documentTitle', 'page', 'relativePath', 'path', 'title', 'docId', 'nodeId']) || '未返回页面信息';
+    const legacyPageUrl = value(item, ['documentUrl', 'pageUrl', 'sourceUrl', 'documentHref']);
+    const legacyPageKind = value(item, ['documentUrlKind', 'pageUrlKind', 'sourceUrlKind', 'documentHrefKind']);
+    const reportPageLink = (typeof window !== 'undefined' && window.WandaoTaskReport?.resourcePageLink?.(item)) || {
+      url: legacyPageUrl,
+      kind: legacyPageKind === 'platform_entry' ? 'platform_entry' : 'direct_page',
+      label: value(item, ['documentUrlLabel', 'pageUrlLabel', 'sourceUrlLabel', 'documentHrefLabel'])
+    };
     const link = value(item, ['url', 'href', 'src', 'source', 'target', 'file', 'resource']) || '未返回资源链接';
     const reason = value(item, ['error', 'reason', 'message', 'code']);
-    return `${index + 1}. 页面：${page}；资源：${link}${reason ? `；原因：${reason}` : ''}`;
+    const documentId = value(item, ['documentId', 'docGuid', 'docId', 'nodeId']);
+    const pageLabel = page.replace(/([\\\[\]])/g, '\\$1');
+    // Detailed-log tests intentionally run this formatter without the DOM
+    // helpers. Actual click handling still performs full URL validation.
+    const hasSafePageLink = /^https?:\/\/[^\s<>"'`]+$/i.test(reportPageLink.url);
+    const pageReference = hasSafePageLink && reportPageLink.kind === 'direct_page'
+      ? `[${pageLabel}](${reportPageLink.url})`
+      : page;
+    const platformReference = hasSafePageLink && reportPageLink.kind === 'platform_entry'
+      ? `；平台：[${reportPageLink.label || '打开平台'}](${reportPageLink.url})${documentId ? `（文档 ID：${documentId}；可在任务中心展开失败项后点击“定位到为知笔记”）` : ''}`
+      : '';
+    const resourceReference = /^https?:\/\//i.test(link) ? `[打开资源](${link})` : link;
+    return `${index + 1}. 页面：${pageReference}${platformReference}；资源：${resourceReference}${reason ? `；原因：${reason}` : ''}`;
   });
   const headline = retryingFailures
     ? `重试后仍有 ${resourceFailures.length} 个资源未导出，请确认资源本身是否不可导出：`
@@ -1054,6 +1239,7 @@ function log(message, type = 'info', options = {}) {
 function clearLog() {
   userLogEntries.length = 0;
   detailLogEntries.length = 0;
+  logPanelRenderCount = LOG_PANEL_RENDER_LIMIT;
   pythonLogSummaryBuffer = '';
   pythonLogProcessor?.reset?.();
   renderLogPanel();
@@ -1454,6 +1640,12 @@ async function performTaskHistoryLoad() {
       total: Math.max(0, Number(savedProgress.total) || 0),
       detail: String(savedProgress.detail || '')
     };
+    if (
+      (Array.isArray(task.logs) && task.logs.length > 500)
+      || String(task.error || '').length > 4000
+      || String(task.errorInfo?.technicalMessage || '').length > 4000
+      || String(task.errorInfo?.legacyMessage || '').length > 4000
+    ) needsMigration = true;
     return task;
   }));
   const runningTaskId = mainPythonProcessState.taskId;
@@ -1486,6 +1678,46 @@ function loadTaskHistory() {
 async function saveTaskHistory() {
   const filePath = taskHistoryPath();
   if (!filePath) return;
+  const persistedLogLimit = 500;
+  const persistedErrorLimit = 4000;
+  const compactText = (value, maxLength) => {
+    const text = (value === null || value === undefined
+      ? ''
+      : typeof value === 'string' ? value : JSON.stringify(value))
+      .replace(/\s+/g, ' ').trim();
+    return text.length > maxLength ? `${text.slice(0, maxLength)}...` : text;
+  };
+  const compactErrorInfo = (info) => {
+    if (!info || typeof info !== 'object') return null;
+    const compact = {};
+    [
+      'kind', 'schemaVersion', 'code', 'category', 'categoryLabel', 'userMessage',
+      'recovery', 'retryable', 'correlationId', 'provider', 'operation', 'status'
+    ].forEach((key) => {
+      if (info[key] !== undefined && info[key] !== null && info[key] !== '') compact[key] = info[key];
+    });
+    ['technicalMessage', 'legacyMessage'].forEach((key) => {
+      const value = compactText(info[key], persistedErrorLimit);
+      if (value) compact[key] = value;
+    });
+    return compact;
+  };
+  const compactLogs = (logs) => {
+    if (!Array.isArray(logs) || logs.length <= persistedLogLimit) return logs || [];
+    const important = logs.filter((entry) => (
+      entry?.type === 'error'
+      || entry?.type === 'warn'
+      || /(?:fail|error)/i.test(String(entry?.event || ''))
+    ));
+    const selected = [];
+    const seen = new Set();
+    for (const entry of [...logs.slice(0, 150), ...important.slice(-200), ...logs.slice(-150)]) {
+      if (seen.has(entry)) continue;
+      seen.add(entry);
+      selected.push(entry);
+    }
+    return selected.slice(0, persistedLogLimit);
+  };
   const tasks = await Promise.all(taskHistory.slice(0, MAX_TASK_HISTORY).map(async (task) => {
     const { pendingSave, detailStartIndex, ...persistable } = task;
     const rawArgs = Array.isArray(task.args) ? task.args : [];
@@ -1509,9 +1741,13 @@ async function saveTaskHistory() {
     }
     persistable.resultData = maskSensitiveValue(persistable.resultData);
     persistable.report = maskSensitiveValue(persistable.report);
-    persistable.errorInfo = maskSensitiveValue(persistable.errorInfo);
-    persistable.error = maskSensitiveText(persistable.error || '');
-    persistable.logs = maskSensitiveValue(persistable.logs || []);
+    persistable.errorInfo = maskSensitiveValue(compactErrorInfo(persistable.errorInfo));
+    persistable.error = maskSensitiveText(compactText(persistable.error || '', persistedErrorLimit));
+    persistable.logs = maskSensitiveValue(compactLogs(persistable.logs || []));
+    if (Array.isArray(task.logs) && task.logs.length > persistedLogLimit) {
+      persistable.logsTruncated = true;
+      persistable.logsTotal = task.logs.length;
+    }
     return persistable;
   }));
   const content = JSON.stringify({
@@ -1743,7 +1979,7 @@ function normalizedTaskReport(task) {
   };
 }
 
-function renderTaskFailureDetails(title, items, className, limit = 12) {
+function renderTaskFailureDetails(title, items, className, limit = 12, options = {}) {
   const list = Array.isArray(items) ? items : [];
   if (!list.length) return '';
   const shown = list.slice(0, limit);
@@ -1760,13 +1996,72 @@ function renderTaskFailureDetails(title, items, className, limit = 12) {
     const parentContext = parent && String(parent) !== String(subject) ? parent : '';
     return describe(item, parentContext);
   };
+  const linkifyFailureText = (text) => {
+    const value = String(text || '');
+    const urlPattern = /https?:\/\/[^\s<>"'`，。；;（）(){}\[\]]+/gi;
+    let cursor = 0;
+    let html = '';
+    let match;
+    while ((match = urlPattern.exec(value))) {
+      const url = match[0];
+      html += escapeHtml(value.slice(cursor, match.index));
+      if (isSafeExternalHttpUrl(url)) {
+        html += `<a class="task-history-failure-link" href="${escapeHtml(url)}" data-external-link="true" rel="noreferrer noopener">${escapeHtml(url)}</a>`;
+      } else {
+        html += escapeHtml(url);
+      }
+      cursor = match.index + url.length;
+    }
+    return html + escapeHtml(value.slice(cursor));
+  };
+  const externalFailureLink = (url, label) => isSafeExternalHttpUrl(url)
+    ? `<a class="task-history-failure-link" href="${escapeHtml(url)}" data-external-link="true" rel="noreferrer noopener">${escapeHtml(label)}</a>`
+    : escapeHtml(url);
+  const renderFailureItem = (item) => {
+    const description = describeItem(item);
+    const pageLink = window.WandaoTaskReport?.resourcePageLink?.(item) || {
+      url: window.WandaoTaskReport?.resourcePageUrl?.(item)
+        || item?.documentUrl || item?.pageUrl || item?.sourceUrl || item?.documentHref || '',
+      kind: 'direct_page',
+      label: ''
+    };
+    const nestedResource = item?.resource && typeof item.resource === 'object' ? item.resource : {};
+    const resourceUrl = item?.url || item?.href || item?.src || item?.target || item?.file
+      || nestedResource.url || nestedResource.href || nestedResource.src || '';
+    const documentId = item?.documentId || item?.docGuid || item?.docId || item?.nodeId || '';
+    const knowledgeBaseId = item?.knowledgeBaseId || item?.kbGuid || '';
+    const canLocateWizNote = options.providerId === 'wiz'
+      && pageLink.kind === 'platform_entry'
+      && pageLink.url === 'https://www.wiz.cn/xapp'
+      && /^[A-Za-z0-9][A-Za-z0-9-]{0,127}$/.test(String(documentId))
+      && (!knowledgeBaseId || /^[A-Za-z0-9][A-Za-z0-9-]{0,127}$/.test(String(knowledgeBaseId)));
+    const pageMarker = pageLink.url && pageLink.kind === 'direct_page' && !description.includes(pageLink.url)
+      ? `；页面：${externalFailureLink(pageLink.url, pageLink.label || '打开页面')}`
+      : '';
+    const platformMarker = pageLink.url && pageLink.kind === 'platform_entry'
+      ? `；平台：${externalFailureLink(pageLink.url, pageLink.label || '打开平台')}${documentId ? `（文档 ID：${escapeHtml(documentId)}）` : ''}`
+      : '';
+    const resourceMarker = resourceUrl && !description.includes(resourceUrl)
+      ? `；资源：${externalFailureLink(resourceUrl, '打开资源')}`
+      : '';
+    const locateControl = canLocateWizNote
+      ? ` <button class="btn-text task-history-locate-note" type="button" data-history-action="locate-wiz-note" data-document-id="${escapeHtml(documentId)}" data-knowledge-base-id="${escapeHtml(knowledgeBaseId)}" title="在已登录的为知笔记页面中按文档 ID 精确定位">定位到为知笔记</button>`
+      : '';
+    const canLocateSourcePage = options.providerId !== 'wiz'
+      && pageLink.kind === 'direct_page'
+      && isSafeExternalHttpUrl(pageLink.url);
+    const sourceLocateControl = canLocateSourcePage
+      ? ` <button class="btn-text task-history-locate-source" type="button" data-history-action="locate-source-page" data-document-url="${escapeHtml(pageLink.url)}" title="在系统浏览器中打开这篇失败文档的原始页面">定位到原文</button>`
+      : '';
+    return `${linkifyFailureText(description)}${resourceMarker}${pageMarker}${platformMarker}${locateControl}${sourceLocateControl}`;
+  };
   const more = list.length > shown.length
     ? `<p class="task-history-detail-more">还有 ${list.length - shown.length} 项，可导出失败日志查看完整内容。</p>`
     : '';
   return `
     <section class="task-history-detail-block" data-failure-kind="${escapeHtml(className || 'resource')}">
       <h4>${escapeHtml(title)}（${list.length}）</h4>
-      <ul>${shown.map((item) => `<li>${escapeHtml(describeItem(item))}</li>`).join('')}</ul>
+      <ul>${shown.map((item) => `<li>${renderFailureItem(item)}</li>`).join('')}</ul>
       ${more}
     </section>
   `;
@@ -1817,10 +2112,10 @@ function taskHistoryDetailsHtml(task) {
     <details class="task-history-details">
       <summary>展开失败项与恢复建议</summary>
       <div class="task-history-details-content">
-        ${renderTaskFailureDetails('文档失败', documentFailures, 'document')}
-        ${renderTaskFailureDetails('图片失败', imageFailures, 'image')}
-        ${renderTaskFailureDetails('附件失败', attachmentFailures, 'attachment')}
-        ${renderTaskFailureDetails('其他资源失败', otherResourceFailures, 'resource')}
+        ${renderTaskFailureDetails('文档失败', documentFailures, 'document', 12, { providerId: task.providerId })}
+        ${renderTaskFailureDetails('图片失败', imageFailures, 'image', 12, { providerId: task.providerId })}
+        ${renderTaskFailureDetails('附件失败', attachmentFailures, 'attachment', 12, { providerId: task.providerId })}
+        ${renderTaskFailureDetails('其他资源失败', otherResourceFailures, 'resource', 12, { providerId: task.providerId })}
         ${!documentFailures.length && !imageFailures.length && !attachmentFailures.length && !otherResourceFailures.length && failurePreview.length ? `
           <section class="task-history-detail-block">
             <h4>关键失败摘要</h4>
@@ -1880,8 +2175,11 @@ function renderTaskStatusOrb() {
   const status = task ? taskDisplayStatus(task) : '';
   const isActive = ['running', 'stopping'].includes(status);
   if (!task || (!isActive && dismissedTaskStatusOrbId === task.id)) {
-    orb.hidden = true;
-    orb.replaceChildren();
+    if (!orb.hidden || orb.childElementCount) {
+      orb.hidden = true;
+      orb.replaceChildren();
+      delete orb.dataset.renderKey;
+    }
     return;
   }
   const state = taskStatusOrbState(task);
@@ -1889,20 +2187,33 @@ function renderTaskStatusOrb() {
   const originName = TOOLS[origin]?.title || PRIMARY_NAV_ITEMS.find((item) => item.id === origin)?.label || '任务页面';
   const mark = state.status === 'completed' ? '✓' : (state.status === 'partial' || state.status === 'stopped' ? '!' : (state.status === 'failed' ? '×' : '•'));
   const retryCount = taskFailureCount(task);
-  const retryButton = canRetryFailureItems(task)
-    ? `<button class="task-status-orb-retry" type="button" data-task-orb-action="retry" title="只重新处理这次任务失败的文档或资源">重试失败项${retryCount > 1 ? `（${retryCount}）` : ''}</button>`
-    : '';
+  const canRetry = canRetryFailureItems(task);
+  const renderKey = [task.id, origin, state.status, isActive, canRetry].join('|');
   orb.hidden = false;
-  orb.className = `task-status-orb ${escapeHtml(state.status)}`;
-  orb.innerHTML = `
-    <button class="task-status-orb-main" type="button" data-task-orb-action="return" aria-label="返回任务发起页面：${escapeHtml(originName)}">
-      <span class="task-status-orb-mark" aria-hidden="true">${mark}</span>
-      <span class="task-status-orb-copy"><strong>${escapeHtml(state.label)}</strong><span>${escapeHtml(task.title || task.providerTitle || '最近任务')}</span></span>
-    </button>
-    ${retryButton}
-    <button class="task-status-orb-center" type="button" data-task-orb-action="task-center">任务中心</button>
-    ${isActive ? '' : '<button class="task-status-orb-dismiss" type="button" data-task-orb-action="dismiss" aria-label="隐藏最近任务提示">×</button>'}
-  `;
+  if (orb.dataset.renderKey !== renderKey) {
+    orb.className = `task-status-orb ${state.status}`;
+    orb.innerHTML = `
+      <button class="task-status-orb-main" type="button" data-task-orb-action="return" aria-label="返回任务发起页面">
+        <span class="task-status-orb-mark" aria-hidden="true"></span>
+        <span class="task-status-orb-copy"><strong></strong><span></span></span>
+      </button>
+      ${canRetry ? '<button class="task-status-orb-retry" type="button" data-task-orb-action="retry" title="只重新处理这次任务失败的文档或资源"></button>' : ''}
+      <button class="task-status-orb-center" type="button" data-task-orb-action="task-center">任务中心</button>
+      ${isActive ? '' : '<button class="task-status-orb-dismiss" type="button" data-task-orb-action="dismiss" aria-label="隐藏最近任务提示">×</button>'}
+    `;
+    orb.dataset.renderKey = renderKey;
+  }
+  const mainButton = orb.querySelector('.task-status-orb-main');
+  const markElement = orb.querySelector('.task-status-orb-mark');
+  const copy = orb.querySelector('.task-status-orb-copy');
+  const label = copy?.querySelector('strong');
+  const title = copy?.querySelector('span');
+  if (mainButton) mainButton.setAttribute('aria-label', `返回任务发起页面：${originName}`);
+  if (markElement) markElement.textContent = mark;
+  if (label) label.textContent = state.label;
+  if (title) title.textContent = task.title || task.providerTitle || '最近任务';
+  const retryButton = orb.querySelector('.task-status-orb-retry');
+  if (retryButton) retryButton.textContent = `重试失败项${retryCount > 1 ? `（${retryCount}）` : ''}`;
 }
 
 function dismissTaskStatusOrb() {
@@ -1988,13 +2299,48 @@ async function exportTaskFailureLog(taskId) {
   log('已导出失败日志。', 'success');
 }
 
-async function handleTaskAction(task, action) {
+async function locateWizFailureDocument(task, documentId, knowledgeBaseId = '') {
+  if (task?.providerId !== 'wiz') throw new Error('只有为知笔记失败项支持页面内精确定位。');
+  if (isRunning || activeCommandOwner) {
+    notifyUser('当前已有任务运行中，请等待结束后再定位为知笔记。', 'warn');
+    return;
+  }
+  const docId = String(documentId || '').trim();
+  const kbId = String(knowledgeBaseId || '').trim();
+  if (!/^[A-Za-z0-9][A-Za-z0-9-]{0,127}$/.test(docId)) {
+    throw new Error('失败项没有可用于定位的有效为知文档 ID。');
+  }
+  if (kbId && !/^[A-Za-z0-9][A-Za-z0-9-]{0,127}$/.test(kbId)) {
+    throw new Error('失败项包含无效的为知知识库 ID。');
+  }
+  const script = String(task.script || '').trim();
+  if (!script) throw new Error('这条任务未记录为知导出脚本，无法定位笔记。');
+  const args = ['--locate-doc', docId];
+  if (kbId) args.push('--locate-kb', kbId);
+  const result = await window.electronAPI.runPythonCommand(script, args, { providerId: 'wiz' });
+  if (!result?.success) throw new Error(result?.error || '为知笔记定位失败。');
+  const title = String(result?.data?.title || '').trim();
+  notifyUser(title ? `已在为知笔记中定位到“${title}”。` : '已在为知笔记中定位到目标笔记。', 'success');
+}
+
+async function locateSourcePage(url) {
+  const sourceUrl = String(url || '').trim();
+  if (!isSafeExternalHttpUrl(sourceUrl)) {
+    throw new Error('失败项没有可用于定位的有效原文链接。');
+  }
+  const result = await window.electronAPI.openExternal(sourceUrl);
+  if (!result?.success) throw new Error(result?.error || '打开原文页面失败。');
+}
+
+async function handleTaskAction(task, action, options = {}) {
   if (!task && action !== 'task-center') return;
   if (action === 'copy') return copyTaskReport(task.id);
   if (action === 'copy-failures') return copyTaskFailures(task.id);
   if (action === 'export-failure-log') return exportTaskFailureLog(task.id);
   if (action === 'open-report') return openTaskArtifact(task, 'report');
   if (action === 'open-output') return openTaskArtifact(task, 'output');
+  if (action === 'locate-wiz-note') return locateWizFailureDocument(task, options.documentId, options.knowledgeBaseId);
+  if (action === 'locate-source-page') return locateSourcePage(options.documentUrl);
   if (action === 'resume') return resumeTask(task);
   if (action === 'task-center') switchTool('task-center');
 }
@@ -5463,6 +5809,7 @@ function switchTool(toolId) {
   if (!configLoadsSavedValues && config.type !== 'guide') {
     restoreFormDraftForProvider(currentTool);
   }
+  restoreActiveTaskFormValues(config);
   if (config.type !== 'guide') {
     enhanceRecentInputsForProvider(currentTool);
   }
@@ -7421,7 +7768,8 @@ function isAllowedWhileRunningControl(control) {
   if (control.matches('[id$="-stop"], [id$="-login-done"], [data-task-orb-action], ' +
     '[data-history-action="copy"], [data-history-action="copy-failures"], ' +
     '[data-history-action="export-failure-log"], [data-history-action="open-output"], ' +
-    '[data-history-action="open-report"]')) {
+    '[data-history-action="open-report"], [data-history-action="locate-wiz-note"], '
+    + '[data-history-action="locate-source-page"]')) {
     return true;
   }
   if (control.matches('[data-tool]')) return isPrimaryWorkbenchView(control.dataset.tool);
@@ -8204,6 +8552,18 @@ document.addEventListener('DOMContentLoaded', () => {
   });
   document.getElementById('btn-history-clear-filters')?.addEventListener('click', clearTaskHistoryFilters);
   document.getElementById('task-history-list')?.addEventListener('click', (event) => {
+    const externalLink = event.target.closest('a[data-external-link]');
+    if (externalLink) {
+      event.preventDefault();
+      window.electronAPI.openExternal(externalLink.href)
+        .then((result) => {
+          if (!result?.success) {
+            log(`打开外部链接失败：${result?.error || externalLink.href}`, 'error');
+          }
+        })
+        .catch((error) => log(`打开外部链接失败：${formatError(error)}`, 'error'));
+      return;
+    }
     const button = event.target.closest('[data-history-action]');
     if (button?.dataset.historyAction === 'clear-filters') {
       clearTaskHistoryFilters();
@@ -8218,7 +8578,11 @@ document.addEventListener('DOMContentLoaded', () => {
         .catch((error) => log(`执行任务操作失败：${formatError(error)}`, 'error'));
       return;
     }
-    handleTaskAction(task, button.dataset.historyAction)
+    handleTaskAction(task, button.dataset.historyAction, {
+      documentId: button.dataset.documentId,
+      knowledgeBaseId: button.dataset.knowledgeBaseId,
+      documentUrl: button.dataset.documentUrl
+    })
       .catch((error) => log(`执行任务操作失败：${formatError(error)}`, 'error'));
   });
   document.getElementById('task-status-orb')?.addEventListener('click', (event) => {
@@ -8252,6 +8616,7 @@ document.addEventListener('DOMContentLoaded', () => {
   });
 
   document.getElementById('btn-settings').addEventListener('click', toggleLogViewMode);
+  document.getElementById('btn-load-earlier-log')?.addEventListener('click', loadEarlierLogEntries);
   renderLogPanel();
   setLogCollapsed(true);
 

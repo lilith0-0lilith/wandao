@@ -219,11 +219,18 @@ def connect_wiz_browser(
     initial_url: str = WIZ_APP_URL,
     *,
     force_new_page: bool = False,
+    keep_started_browser: bool = False,
 ) -> tuple[CDPClient, subprocess.Popen[Any] | None]:
     chrome_proc: subprocess.Popen[Any] | None = None
     if not chrome_debug_available(args.port):
         profile = Path(args.profile_dir).resolve() if args.profile_dir else default_profile_path()
-        chrome_proc = start_chrome(args.port, profile, initial_url, getattr(args, "browser_path", None))
+        chrome_proc = start_chrome(
+            args.port,
+            profile,
+            initial_url,
+            getattr(args, "browser_path", None),
+            breakaway=keep_started_browser,
+        )
         wait_for_debug_port(args.port, timeout=30)
 
     page = open_fresh_wiz_page(args.port, initial_url) if force_new_page and chrome_proc is None else page_for_wiz(args.port)
@@ -277,7 +284,7 @@ def recover_wiz_page(
 
 WIZ_HELPER_JS = r"""
 (() => {
-  if (window.__wandaoWiz && window.__wandaoWiz.version === 8) return true;
+  if (window.__wandaoWiz && window.__wandaoWiz.version === 10) return true;
   window.__wandaoWizDocumentIndex = null;
 
   const reqToPromise = (req) => new Promise((resolve, reject) => {
@@ -520,7 +527,10 @@ WIZ_HELPER_JS = r"""
       }
     }
     layer.scrollTop = originalTop;
-    window.__wandaoWizDocumentIndex = result;
+    // A fresh tab can mount its virtual-list container before rows arrive.
+    // Do not preserve that transient empty result, or focusDocument would
+    // keep retrying against an empty index until its timeout.
+    if (Object.keys(result).length) window.__wandaoWizDocumentIndex = result;
     return result;
   };
 
@@ -567,6 +577,28 @@ WIZ_HELPER_JS = r"""
     return null;
   };
 
+  const focusDocument = async (docGuid, expectedTitle, timeoutMs = 15000) => {
+    const wantedTitle = normalizeTitle(expectedTitle);
+    const deadline = Date.now() + Math.max(1000, Number(timeoutMs) || 15000);
+    let clicked = false;
+    while (Date.now() < deadline) {
+      // A fresh xapp tab can have IndexedDB ready before its virtual list is
+      // mounted. Wait for the actual selectable surface before indexing it.
+      if (!listScrollLayer()) {
+        await new Promise((resolve) => setTimeout(resolve, 100));
+        continue;
+      }
+      if (!clicked) clicked = await clickDocument(docGuid);
+      const root = editorRoot();
+      const title = editorTitle(root);
+      if (clicked && root && (!wantedTitle || title === wantedTitle)) {
+        return { selected: true, title, documentId: docGuid };
+      }
+      await new Promise((resolve) => setTimeout(resolve, 100));
+    }
+    return { selected: false, title: "", documentId: docGuid };
+  };
+
   const beginImageLoad = (url, timeoutMs = 12000) => {
     const key = `wandao-image-${Date.now()}-${Math.random().toString(36).slice(2)}`;
     window.__wandaoWizImages = window.__wandaoWizImages || {};
@@ -591,7 +623,7 @@ WIZ_HELPER_JS = r"""
   };
 
   window.__wandaoWiz = {
-    version: 8,
+    version: 10,
     snapshot,
     health,
     noteDownload,
@@ -602,6 +634,7 @@ WIZ_HELPER_JS = r"""
     cancelImageLoad,
     domDocumentIndex,
     domEditorDocument,
+    focusDocument,
   };
   return true;
 })()
@@ -901,6 +934,23 @@ class ResourceSaver:
         target = urllib.parse.urlsplit(url)
         trusted = urllib.parse.urlsplit(self.kb_server)
         return bool(target.netloc) and target.scheme in {"http", "https"} and target.netloc.lower() == trusted.netloc.lower()
+
+    def document_reference(self) -> dict[str, str]:
+        """Return a browser-safe reference for a resource's owning note.
+
+        A knowledge base server serves the API and resources, but its
+        ``/editor/<kb>/<doc>`` path is not a public browser route.  The Wiz
+        web client has no stable document deep-link in its local metadata, so
+        report the real application entry and retain the precise document ID.
+        """
+
+        return {
+            "documentUrl": WIZ_APP_URL,
+            "documentUrlKind": "platform_entry",
+            "documentUrlLabel": "打开为知笔记首页",
+            "documentId": self.doc.doc_guid,
+            "knowledgeBaseId": self.doc.kb_guid,
+        }
 
     @staticmethod
     def external_host(url: str) -> str:
@@ -1290,7 +1340,11 @@ class ResourceSaver:
         except Exception as exc:
             self.fail_image_resource(resource_key, exc)
             self.unavailable_external_image_hosts.add(host)
-            self.failures.append({"url": url, "error": f"外部图片主机不可用：{exc}"})
+            self.failures.append({
+                "url": url,
+                **self.document_reference(),
+                "error": f"外部图片主机不可用：{exc}",
+            })
             return url
 
     def save_data(self, key: str, name: str, payload: dict[str, Any], alt: str = "") -> str:
@@ -1328,7 +1382,7 @@ class ResourceSaver:
             raise
         except Exception as exc:
             self.fail_image_resource(resource_key, exc)
-            self.failures.append({"url": url, "error": str(exc)})
+            self.failures.append({"url": url, **self.document_reference(), "error": str(exc)})
             return url
         relative_path = self.save_data(key, file_name or src, payload, alt)
         self.complete_image_resource(resource_key, relative_path)
@@ -1358,7 +1412,7 @@ class ResourceSaver:
             raise
         except Exception as exc:  # noqa: BLE001 - keep exporting the note body.
             self.fail_image_resource(resource_key, exc)
-            self.failures.append({"url": url, "error": str(exc)})
+            self.failures.append({"url": url, **self.document_reference(), "error": str(exc)})
             return url
 
 
@@ -1894,6 +1948,60 @@ def scan_wiz(args: argparse.Namespace) -> dict[str, Any]:
             chrome_proc.terminate()
 
 
+def locate_wiz_document(args: argparse.Namespace) -> dict[str, Any]:
+    """Open one known note in a fresh Wiz web-app tab by its stable ID."""
+
+    document_id = str(getattr(args, "locate_doc", "") or "").strip()
+    knowledge_base_id = str(getattr(args, "locate_kb", "") or "").strip()
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9-]{0,127}", document_id):
+        raise ExportError("为知笔记定位需要有效的文档 ID。")
+    if knowledge_base_id and not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9-]{0,127}", knowledge_base_id):
+        raise ExportError("为知笔记定位需要有效的知识库 ID。")
+
+    cdp, chrome_proc = connect_wiz_browser(
+        args,
+        force_new_page=True,
+        keep_started_browser=True,
+    )
+    try:
+        snapshot = wait_for_login_state(cdp, timeout=30)
+        matches = [doc for doc in docs_from_snapshot(snapshot) if doc.doc_guid == document_id]
+        if knowledge_base_id:
+            matches = [doc for doc in matches if doc.kb_guid == knowledge_base_id]
+        if len(matches) != 1:
+            raise ExportError("当前为知账号中没有找到这篇笔记，或笔记不属于记录的知识库。")
+
+        doc = matches[0]
+        install_helpers(cdp, timeout=20)
+        expression = (
+            f"window.__wandaoWiz.focusDocument({js_string(doc.doc_guid)}, "
+            f"{js_string(doc.title)}, 20000)"
+        )
+        result = cdp.evaluate(expression, timeout=25)
+        if not isinstance(result, dict) or not result.get("selected"):
+            raise ExportError("已打开为知笔记，但未能在页面列表中定位到目标笔记。请重新读取目录或在为知中确认笔记仍存在。")
+        selected_title = str(result.get("title") or "")
+        if selected_title != doc.title:
+            raise ExportError("为知页面返回的笔记标题与目标 ID 不一致，未确认定位结果。")
+        emit(
+            args,
+            f"已定位为知笔记：{doc.title}",
+            event="document.located",
+            doc={"id": doc.doc_guid, "title": doc.title},
+        )
+        return {
+            "success": True,
+            "documentId": doc.doc_guid,
+            "knowledgeBaseId": doc.kb_guid,
+            "title": doc.title,
+        }
+    finally:
+        cdp.close()
+        # Locating is an explicit request to show the user this note. Keep a
+        # browser started for that purpose alive after the automation detaches.
+        # The generic export cleanup flag must not close the newly located tab.
+
+
 def select_wiz_documents(docs: list[WizDoc], selected_doc_ids: set[str] | None = None) -> list[WizDoc]:
     if not selected_doc_ids:
         return docs
@@ -2090,7 +2198,15 @@ def export_wiz(args: argparse.Namespace) -> dict[str, Any]:
                             event="resource.download.failed",
                             level="error",
                             doc={"id": doc.doc_guid, "title": doc.title, "index": index, "path": str(md_path)},
-                            resource={"type": "image", "url": failure.get("url", "")},
+                            resource={
+                                "type": "image",
+                                "url": failure.get("url", ""),
+                                "documentUrl": failure.get("documentUrl", ""),
+                                "documentUrlKind": failure.get("documentUrlKind", ""),
+                                "documentUrlLabel": failure.get("documentUrlLabel", ""),
+                                "documentId": failure.get("documentId", ""),
+                                "knowledgeBaseId": failure.get("knowledgeBaseId", ""),
+                            },
                             error={"message": failure.get("error", "")},
                         )
                     exported += 1
@@ -2219,6 +2335,8 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--gui", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--login", action="store_true", help="打开为知网页版并保存登录状态摘要")
     parser.add_argument("--scan-toc", action="store_true", help="读取为知目录并输出 JSON")
+    parser.add_argument("--locate-doc", default="", help=argparse.SUPPRESS)
+    parser.add_argument("--locate-kb", default="", help=argparse.SUPPRESS)
     parser.add_argument("--output", default=str(default_data_dir() / "exports" / "wiz"), help="输出目录")
     parser.add_argument("--doc-id", action="append", dest="selected_doc_ids", default=[], help="只导出指定笔记 ID，可重复")
     parser.add_argument("--doc-id-file", default="", help="从文件读取要导出的笔记 ID，JSON 数组或逐行文本均可")
@@ -2245,6 +2363,9 @@ def main(argv: list[str] | None = None) -> int:
             return 0
         if args.scan_toc:
             print(json.dumps(scan_wiz(args), ensure_ascii=False, indent=2))
+            return 0
+        if args.locate_doc:
+            print(json.dumps(locate_wiz_document(args), ensure_ascii=False, indent=2))
             return 0
         result = export_wiz(args)
         print(json.dumps(result, ensure_ascii=False, indent=2))

@@ -62,12 +62,13 @@ test('resource recovery logs always include the failed page and resource link', 
   const report = {
     stats: { imageSuccess: 9, imageFailed: 1 },
     documentFailures: [],
-    resourceFailures: [{ document: '第二页', url: 'https://cdn.example.test/image.png', error: '404' }]
+    resourceFailures: [{ document: '第二页', documentUrl: 'https://wiz.example.test/editor/kb/doc', url: 'https://cdn.example.test/image.png', error: '404' }]
   };
 
   context.__resource('partial', '导出', report);
   assert.match(logs[0].message, /网络波动或资源不存在/);
   assert.match(logs[0].message, /第二页/);
+  assert.match(logs[0].message, /https:\/\/wiz\.example\.test\/editor\/kb\/doc/);
   assert.match(logs[0].message, /https:\/\/cdn\.example\.test\/image\.png/);
   logs.length = 0;
   context.__resource('partial', '导出', report, true);

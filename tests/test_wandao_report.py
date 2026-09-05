@@ -169,6 +169,33 @@ class WandaoReportTests(unittest.TestCase):
         self.assertEqual(image["relativePath"], "目录/图片.md")
         self.assertEqual(attachment["document"], "目录/附件.md")
 
+    def test_nested_resource_failure_inherits_page_link_semantics(self) -> None:
+        report = finalize_report(
+            {
+                "resourceFailures": [
+                    {
+                        "title": "资料札记-728｜城市公共绿道",
+                        "documentUrl": "https://www.wiz.cn/xapp",
+                        "documentUrlKind": "platform_entry",
+                        "documentUrlLabel": "打开为知笔记",
+                        "documentId": "doc-123",
+                        "knowledgeBaseId": "kb-456",
+                        "failures": [
+                            {"kind": "image", "url": "https://cdn.example.test/progress", "error": "图片响应 HTTP 404"}
+                        ],
+                    }
+                ]
+            }
+        )
+
+        item = report["resourceFailures"][0]
+        self.assertEqual(item["title"], "资料札记-728｜城市公共绿道")
+        self.assertEqual(item["documentUrl"], "https://www.wiz.cn/xapp")
+        self.assertEqual(item["documentUrlKind"], "platform_entry")
+        self.assertEqual(item["documentUrlLabel"], "打开为知笔记")
+        self.assertEqual(item["documentId"], "doc-123")
+        self.assertEqual(item["knowledgeBaseId"], "kb-456")
+
     def test_local_image_alias_is_deduplicated_against_generic_resource_failure(self) -> None:
         report = finalize_report(
             {

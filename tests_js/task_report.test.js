@@ -1,4 +1,5 @@
 ﻿const assert = require('node:assert/strict');
+const fs = require('node:fs');
 const test = require('node:test');
 const {
   collectFailureDiagnostics,
@@ -10,6 +11,7 @@ const {
   taskDocumentFailureCount,
   taskFailureCount,
   taskResourceFailureCount,
+  resourcePageLink,
   taskStatusText
 } = require('../wandao_electron/renderer/task_report');
 
@@ -187,6 +189,49 @@ test('nested image and attachment warnings inherit their document context', () =
   assert.equal(report.stats.resourceFailed, 2);
   assert.equal(report.imageFailures[0].relativePath, '目录/图片.md');
   assert.equal(report.attachmentFailures[0].document, '目录/附件.md');
+});
+
+test('nested resource failures preserve explicit page-link semantics', () => {
+  const report = normalizeTaskReport({
+    resourceFailures: [{
+      title: '为知笔记',
+      documentUrl: 'https://www.wiz.cn/xapp',
+      documentUrlKind: 'platform_entry',
+      documentUrlLabel: '打开为知笔记',
+      documentId: 'doc-123',
+      failures: [{ kind: 'image', url: 'https://cdn.example.test/image.png', error: 'HTTP 404' }]
+    }]
+  });
+
+  const link = resourcePageLink(report.resourceFailures[0]);
+  assert.equal(link.url, 'https://www.wiz.cn/xapp');
+  assert.equal(link.kind, 'platform_entry');
+  assert.equal(link.label, '打开为知笔记');
+  assert.equal(report.resourceFailures[0].documentId, 'doc-123');
+});
+
+test('task-center failure links open outside the application WebView', () => {
+  const appJs = fs.readFileSync('wandao_electron/renderer/app.js', 'utf8');
+  const start = appJs.indexOf("document.getElementById('task-history-list')?.addEventListener('click', (event) => {");
+  const end = appJs.indexOf("document.getElementById('task-status-orb')", start);
+  assert.notEqual(start, -1);
+  assert.notEqual(end, -1);
+  const handler = appJs.slice(start, end);
+
+  assert.match(handler, /event\.target\.closest\('a\[data-external-link\]'\)/);
+  assert.match(handler, /event\.preventDefault\(\)/);
+  assert.match(handler, /window\.electronAPI\.openExternal\(externalLink\.href\)/);
+});
+
+test('non-Wiz failures with a verified page URL provide a source locator', () => {
+  const appJs = fs.readFileSync('wandao_electron/renderer/app.js', 'utf8');
+  const details = appJs.slice(appJs.indexOf('function renderTaskFailureDetails'), appJs.indexOf('function renderTaskErrorProtocol'));
+  const actions = appJs.slice(appJs.indexOf('async function locateSourcePage'), appJs.indexOf('function startHistoryTask'));
+
+  assert.match(details, /options\.providerId !== 'wiz'/);
+  assert.match(details, /data-history-action="locate-source-page"/);
+  assert.match(details, /定位到原文/);
+  assert.match(actions, /window\.electronAPI\.openExternal\(sourceUrl\)/);
 });
 
 test('local image reference aliases are de-duplicated with generic resources', () => {

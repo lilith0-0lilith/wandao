@@ -72,7 +72,18 @@
     'resourcePath', 'localPath', 'reference', 'image', 'attachment', 'name'
   ];
   const RESOURCE_DOCUMENT_KEYS = [
-    'document', 'relativePath', 'path', 'title', 'docId', 'nodeId', 'itemKey'
+    'document', 'documentTitle', 'relativePath', 'path', 'title', 'docId', 'nodeId', 'itemKey'
+  ];
+  const RESOURCE_PAGE_KEYS = ['documentUrl', 'pageUrl', 'sourceUrl', 'documentHref'];
+  const RESOURCE_PAGE_KIND_KEYS = ['documentUrlKind', 'pageUrlKind', 'sourceUrlKind', 'documentHrefKind'];
+  const RESOURCE_PAGE_LABEL_KEYS = ['documentUrlLabel', 'pageUrlLabel', 'sourceUrlLabel', 'documentHrefLabel'];
+  const RESOURCE_LOCATION_KEYS = ['documentId', 'knowledgeBaseId'];
+  const RESOURCE_CONTEXT_KEYS = [
+    ...RESOURCE_DOCUMENT_KEYS,
+    ...RESOURCE_PAGE_KEYS,
+    ...RESOURCE_PAGE_KIND_KEYS,
+    ...RESOURCE_PAGE_LABEL_KEYS,
+    ...RESOURCE_LOCATION_KEYS
   ];
   const RESOURCE_ERROR_KEYS = ['error', 'reason', 'message', 'status', 'code', 'warning'];
   const RESOURCE_CONTAINER_KEYS = ['failures', 'warnings', 'items', 'resources', 'entries'];
@@ -92,6 +103,13 @@
     return '';
   }
 
+  function nestedResourceValue(item, keys) {
+    const direct = firstValue(item, keys);
+    if (direct) return direct;
+    const nested = item?.resource;
+    return nested && typeof nested === 'object' ? firstValue(nested, keys) : '';
+  }
+
   function normalizeResourceKind(value, fallback = 'resource') {
     const text = stringifyIdentity(value).toLowerCase();
     if (/image|图片|img/.test(text)) return 'image';
@@ -106,6 +124,12 @@
       const value = normalizeResourceKind(item[key], '');
       if (RESOURCE_TYPES.has(value)) return value;
     }
+    if (item.resource && typeof item.resource === 'object') {
+      for (const key of ['kind', 'type', 'resourceType', 'assetType', 'category']) {
+        const value = normalizeResourceKind(item.resource[key], '');
+        if (RESOURCE_TYPES.has(value)) return value;
+      }
+    }
     return normalizeResourceKind(inherited, 'resource');
   }
 
@@ -114,11 +138,34 @@
   }
 
   function resourceDocumentIdentity(item) {
-    return firstValue(item, RESOURCE_DOCUMENT_KEYS);
+    return firstValue(item, RESOURCE_DOCUMENT_KEYS) || nestedResourceValue(item, RESOURCE_DOCUMENT_KEYS);
   }
 
   function resourceReferenceIdentity(item) {
-    return firstValue(item, RESOURCE_REFERENCE_KEYS);
+    return firstValue(item, RESOURCE_REFERENCE_KEYS) || nestedResourceValue(item, RESOURCE_REFERENCE_KEYS);
+  }
+
+  function resourcePageLink(item) {
+    const sources = [item, item?.resource].filter((value) => value && typeof value === 'object');
+    for (const source of sources) {
+      for (const key of RESOURCE_PAGE_KEYS) {
+        const url = stringifyIdentity(source[key]);
+        if (!url) continue;
+        const kindKey = `${key}Kind`;
+        const labelKey = `${key}Label`;
+        const declaredKind = stringifyIdentity(source[kindKey] || firstValue(source, RESOURCE_PAGE_KIND_KEYS)).toLowerCase();
+        return {
+          url,
+          kind: declaredKind === 'platform_entry' ? 'platform_entry' : 'direct_page',
+          label: stringifyIdentity(source[labelKey] || firstValue(source, RESOURCE_PAGE_LABEL_KEYS))
+        };
+      }
+    }
+    return { url: '', kind: '', label: '' };
+  }
+
+  function resourcePageUrl(item) {
+    return resourcePageLink(item).url;
   }
 
   function resourceErrorIdentity(item) {
@@ -252,7 +299,7 @@
         return;
       }
       const nextContext = { ...context };
-      RESOURCE_DOCUMENT_KEYS.forEach((key) => {
+      RESOURCE_CONTEXT_KEYS.forEach((key) => {
         if (nextContext[key] === undefined && current[key] !== undefined && current[key] !== null) nextContext[key] = current[key];
       });
       Object.entries(current).forEach(([key, child]) => {
@@ -317,14 +364,16 @@
     ];
     const add = (value, inheritedKind, inheritedContext) => {
       const context = { ...inheritedContext };
-      RESOURCE_DOCUMENT_KEYS.forEach((key) => {
+      RESOURCE_CONTEXT_KEYS.forEach((key) => {
         if (context[key] === undefined && value[key] !== undefined && value[key] !== null) {
           context[key] = value[key];
         }
       });
       const currentKind = resourceKindFromItem(value, inheritedKind);
+      const nestedResource = value.resource && typeof value.resource === 'object' ? value.resource : {};
       appendResourceFailure(items, {
         ...context,
+        ...nestedResource,
         ...value,
         type: currentKind
       });
@@ -344,7 +393,7 @@
       }
       const currentKind = resourceKindFromItem(value, inheritedKind);
       const context = { ...inheritedContext };
-      RESOURCE_DOCUMENT_KEYS.forEach((key) => {
+      RESOURCE_CONTEXT_KEYS.forEach((key) => {
         if (value[key] !== undefined && value[key] !== null && context[key] === undefined) context[key] = value[key];
       });
       let hasChildren = false;
@@ -914,6 +963,8 @@
     collectResourceFailures,
     collectImageFailures,
     collectAttachmentFailures,
+    resourcePageLink,
+    resourcePageUrl,
     warningCount,
     resourceCounts,
     collectDocumentFailures,
