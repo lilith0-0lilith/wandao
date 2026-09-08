@@ -32,6 +32,22 @@ test('directory heartbeat has an explicit long-running fallback', () => {
   assert.match(appJs, /startProgress\(`读取目录：\$\{config\.title\}`, '正在连接远端服务，准备读取目录结构\.\.\.', \{ phase: 'directory' \}\)/);
 });
 
+test('log panel can load earlier entries instead of permanently hiding them', () => {
+  assert.match(indexHtml, /id="btn-load-earlier-log"/);
+  assert.match(appJs, /let logPanelRenderCount = LOG_PANEL_RENDER_LIMIT/);
+  assert.match(appJs, /function loadEarlierLogEntries\(\)[\s\S]*logPanelRenderCount \+ LOG_PANEL_RENDER_LIMIT/);
+  assert.match(appJs, /为保持界面流畅，当前已加载最近 \$\{entries\.length\} 条日志；可点击“加载更早”继续查看。/);
+});
+
+test('resource failures use explicit page links in logs and copied reports', () => {
+  assert.match(appJs, /resourcePageLink\?\.\(item\)/);
+  assert.match(appJs, /kind: legacyPageKind === 'platform_entry' \? 'platform_entry' : 'direct_page'/);
+  assert.ok(appJs.includes('const resourceReference = /^https?:\\/\\//i.test(link)'));
+  assert.match(appJs, /Resource recovery messages use Markdown links/);
+  assert.match(appJs, /pageLink\.kind === 'platform_entry'/);
+  assert.match(appJs, /externalFailureLink\(pageLink\.url, pageLink\.label \|\| '打开页面'\)/);
+});
+
 test('task.started totals become real progress immediately', () => {
   const progress = [];
   const processor = createProcessor({ updateProgress: (...args) => progress.push(args) });

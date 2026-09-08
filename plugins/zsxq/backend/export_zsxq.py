@@ -63,6 +63,7 @@ from wandao_core.browser import (
 from wandao_core.report import finalize_report
 from wandao_core.checkpoint import CheckpointLeaseLostError, WandaoCheckpoint
 from wandao_core.credentials import write_private_json
+from wandao_core.document_links import direct_document_reference
 
 
 SCRIPT_DIR = Path(__file__).resolve().parent
@@ -4218,6 +4219,7 @@ def export_entry(args: argparse.Namespace) -> dict[str, Any]:
             root_sequence = max(root_sequence, 1)
             overview_path = output / "01-专栏正文.md"
             overview_key = str(entry.get("url") or entry_url)
+            overview_reference = direct_document_reference(overview_key)
             overview_item_key = zsxq_item_key_from_source({"href": overview_key, "key": "overview"})
             overview_existing = next((existing[key] for key in canonical_url_keys(overview_key) if key in existing), None)
             overview_needs_comment_update = bool(
@@ -4254,7 +4256,7 @@ def export_entry(args: argparse.Namespace) -> dict[str, Any]:
                     args,
                     f"开始导出知识星球专栏正文：{entry.get('title') or '专栏正文'}",
                     event="document.export.started",
-                    doc={"title": entry.get("title") or "专栏正文", "index": 0, "path": str(overview_path)},
+                    doc={"title": entry.get("title") or "专栏正文", "index": 0, "path": str(overview_path), **overview_reference},
                 )
                 markdown = entry.get("markdown") or "# 专栏正文\n"
                 markdown = ensure_file_links(markdown, entry.get("files") or [])
@@ -4284,15 +4286,15 @@ def export_entry(args: argparse.Namespace) -> dict[str, Any]:
                 )
                 image_success += count
                 if img_errors:
-                    image_failures.append({"document": "专栏正文", "path": str(overview_path), "failures": img_errors})
+                    image_failures.append({"document": "专栏正文", "path": str(overview_path), "failures": img_errors, **overview_reference})
                     for failure in img_errors:
                         emit(
                             args,
                             f"知识星球图片下载失败：专栏正文：{failure.get('error') or failure.get('url') or ''}",
                             event="resource.download.failed",
                             level="error",
-                            doc={"title": "专栏正文", "path": str(overview_path)},
-                            resource={"type": "image", "url": failure.get("url", "")},
+                            doc={"title": "专栏正文", "path": str(overview_path), **overview_reference},
+                            resource={"type": "image", "url": failure.get("url", ""), **overview_reference},
                             error={"message": failure.get("error", "")},
                         )
                 file_count = 0
@@ -4310,15 +4312,15 @@ def export_entry(args: argparse.Namespace) -> dict[str, Any]:
                     )
                     file_success += file_count
                     if file_errors:
-                        file_failures.append({"document": "专栏正文", "path": str(overview_path), "failures": file_errors})
+                        file_failures.append({"document": "专栏正文", "path": str(overview_path), "failures": file_errors, **overview_reference})
                         for failure in file_errors:
                             emit(
                                 args,
                                 f"知识星球附件下载失败：专栏正文：{failure.get('error') or failure.get('url') or ''}",
                                 event="resource.download.failed",
                                 level="error",
-                                doc={"title": "专栏正文", "path": str(overview_path)},
-                                resource={"type": "attachment", "url": failure.get("url", ""), "name": failure.get("name", "")},
+                                doc={"title": "专栏正文", "path": str(overview_path), **overview_reference},
+                                resource={"type": "attachment", "url": failure.get("url", ""), "name": failure.get("name", ""), **overview_reference},
                                 error={"message": failure.get("error", "")},
                             )
                 overview_path.write_text(markdown, encoding="utf-8")
@@ -4340,7 +4342,7 @@ def export_entry(args: argparse.Namespace) -> dict[str, Any]:
                     args,
                     f"知识星球专栏正文导出完成：{entry.get('title') or '专栏正文'}",
                     event="document.export.completed",
-                    doc={"title": entry.get("title") or "专栏正文", "index": 0, "path": str(overview_path)},
+                    doc={"title": entry.get("title") or "专栏正文", "index": 0, "path": str(overview_path), **overview_reference},
                     stats={
                         "imageSuccessInDoc": count,
                         "imageFailuresInDoc": len(img_errors),
@@ -4928,6 +4930,8 @@ def export_entry(args: argparse.Namespace) -> dict[str, Any]:
                             exported_rows.append({"title": item.get("title") or link.get("title") or link.get("text") or href, "path": str(key_existing)})
                         continue
                 title = item.get("title") or link.get("text") or "知识星球文档"
+                document_url = str(item.get("articleUrl") or item.get("topicUrl") or href or "").strip()
+                document_id = str(item.get("topicId") or item.get("topicUid") or "").strip()
                 current_output = Path(link.get("outputDir") or output)
                 raw_markdown = item.get("markdown") or f"# {title}\n"
                 children = filter_follow_zsxq_links((item.get("zsxqLinks") or []) + markdown_links(raw_markdown), args)
@@ -4962,7 +4966,7 @@ def export_entry(args: argparse.Namespace) -> dict[str, Any]:
                     args,
                     f"开始导出知识星球文档：{title}",
                     event="document.export.started",
-                    doc={"title": title, "index": exported + skipped + len(failures) + 1, "path": str(md_path), "source": href},
+                    doc={"title": title, "index": exported + skipped + len(failures) + 1, "path": str(md_path), "source": href, **direct_document_reference(document_url, document_id=document_id)},
                 )
                 total_comments += int(item.get("commentCount") or 0)
                 markdown = ensure_file_links(append_source_meta(raw_markdown, item), item.get("files") or [])
@@ -4978,15 +4982,20 @@ def export_entry(args: argparse.Namespace) -> dict[str, Any]:
                 )
                 image_success += count
                 if img_errors:
-                    image_failures.append({"document": title, "path": str(md_path), "failures": img_errors})
+                    image_failures.append({
+                        "document": title,
+                        "path": str(md_path),
+                        "failures": img_errors,
+                        **direct_document_reference(document_url, document_id=document_id),
+                    })
                     for failure in img_errors:
                         emit(
                             args,
                             f"知识星球图片下载失败：{title}：{failure.get('error') or failure.get('url') or ''}",
                             event="resource.download.failed",
                             level="error",
-                            doc={"title": title, "path": str(md_path), "source": href},
-                            resource={"type": "image", "url": failure.get("url", "")},
+                            doc={"title": title, "path": str(md_path), "source": href, **direct_document_reference(document_url, document_id=document_id)},
+                            resource={"type": "image", "url": failure.get("url", ""), **direct_document_reference(document_url, document_id=document_id)},
                             error={"message": failure.get("error", "")},
                         )
                 file_count = 0
@@ -5004,15 +5013,20 @@ def export_entry(args: argparse.Namespace) -> dict[str, Any]:
                     )
                     file_success += file_count
                     if file_errors:
-                        file_failures.append({"document": title, "path": str(md_path), "failures": file_errors})
+                        file_failures.append({
+                            "document": title,
+                            "path": str(md_path),
+                            "failures": file_errors,
+                            **direct_document_reference(document_url, document_id=document_id),
+                        })
                         for failure in file_errors:
                             emit(
                                 args,
                                 f"知识星球附件下载失败：{title}：{failure.get('error') or failure.get('url') or ''}",
                                 event="resource.download.failed",
                                 level="error",
-                                doc={"title": title, "path": str(md_path), "source": href},
-                                resource={"type": "attachment", "url": failure.get("url", ""), "name": failure.get("name", "")},
+                                doc={"title": title, "path": str(md_path), "source": href, **direct_document_reference(document_url, document_id=document_id)},
+                                resource={"type": "attachment", "url": failure.get("url", ""), "name": failure.get("name", ""), **direct_document_reference(document_url, document_id=document_id)},
                                 error={"message": failure.get("error", "")},
                             )
                 md_path.write_text(markdown, encoding="utf-8")
@@ -5046,7 +5060,7 @@ def export_entry(args: argparse.Namespace) -> dict[str, Any]:
                     args,
                     f"知识星球文档导出完成：{title}",
                     event="document.export.completed",
-                    doc={"title": title, "path": str(md_path), "source": href},
+                    doc={"title": title, "path": str(md_path), "source": href, **direct_document_reference(document_url, document_id=document_id)},
                     stats={
                         "imageSuccessInDoc": count,
                         "imageFailuresInDoc": len(img_errors),
@@ -5095,13 +5109,20 @@ def export_entry(args: argparse.Namespace) -> dict[str, Any]:
             except Exception as exc:
                 if checkpoint and checkpoint_item_key:
                     checkpoint.fail_item(checkpoint_item_key, str(exc))
-                failures.append({"title": link.get("text") or "", "href": href, "error": str(exc)})
+                failed_document_url = str(link.get("topicUrl") or link.get("articleUrl") or href or "").strip()
+                failed_document_id = str(link.get("topicId") or link.get("topicUid") or "").strip()
+                failures.append({
+                    "title": link.get("text") or "",
+                    "href": href,
+                    "error": str(exc),
+                    **direct_document_reference(failed_document_url, document_id=failed_document_id),
+                })
                 emit(
                     args,
                     f"知识星球文档导出失败：{link.get('text') or href}：{exc}",
                     event="document.export.failed",
                     level="error",
-                    doc={"title": link.get("text") or "", "source": href},
+                    doc={"title": link.get("text") or "", "source": href, **direct_document_reference(failed_document_url, document_id=failed_document_id)},
                     error={"type": type(exc).__name__, "message": str(exc)},
                 )
 

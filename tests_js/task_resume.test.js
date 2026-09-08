@@ -200,8 +200,8 @@ test('resource failures are retried when the provider supports failed-item retry
   assert.match(resumeArgs, /taskFailureCount\(task\)/);
   assert.match(resumeTaskHandler, /const retryableFailures = taskFailureCount\(task\)/);
   assert.match(resumeTaskHandler, /失败项，共 \$\{retryableFailures\} 个/);
-  assert.match(taskDetails, /renderTaskFailureDetails\('图片失败', imageFailures, 'image'\)/);
-  assert.match(taskDetails, /renderTaskFailureDetails\('其他资源失败', otherResourceFailures, 'resource'\)/);
+  assert.match(taskDetails, /renderTaskFailureDetails\('图片失败', imageFailures, 'image', 12, \{ providerId: task\.providerId \}\)/);
+  assert.match(taskDetails, /renderTaskFailureDetails\('其他资源失败', otherResourceFailures, 'resource', 12, \{ providerId: task\.providerId \}\)/);
   assert.match(taskDetails, /task-history-recovery/);
   assert.doesNotMatch(taskDetails, /不会把它们误作“失败文档”自动重试/);
 });
@@ -223,7 +223,7 @@ test('historical task rendering normalizes legacy reports and keeps startup inde
   assert.match(normalizedReport, /imageFailures: \[\]/);
   assert.match(normalizedReport, /attachmentFailures: \[\]/);
   assert.match(taskDetails, /const documentFailures = Array\.isArray\(report\.documentFailures\)/);
-  assert.match(taskDetails, /renderTaskFailureDetails\('图片失败', imageFailures, 'image'\)/);
+  assert.match(taskDetails, /renderTaskFailureDetails\('图片失败', imageFailures, 'image', 12, \{ providerId: task\.providerId \}\)/);
   assert.match(appPaths, /try \{\s*await loadTaskHistory\(\);\s*\} catch \(error\)/);
   assert.match(appPaths, /平台页面仍可正常打开/);
 });
@@ -249,6 +249,11 @@ test('running tasks keep workbench navigation but block other platform actions',
   assert.match(guard, /if \(control\.matches\('\[data-tool\]'\)\) return isPrimaryWorkbenchView/);
   assert.match(guard, /\[data-notice-id\], \[data-notice-action\]/);
   assert.match(guard, /if \(control\.matches\('\[data-plugin-action\]'\)\) \{[\s\S]*return !pluginOperationBlocked/);
+  assert.match(appJs, /function restoreActiveTaskFormValues\(provider\)/);
+  assert.match(appJs, /function providerFieldElement\(provider, field\)/);
+  assert.match(appJs, /data-history-key/);
+  assert.match(switching, /restoreActiveTaskFormValues\(config\);/);
+  assert.match(appJs, /if \(!element \|\| !value \|\| String\(element\.value \|\| ''\)\.trim\(\)\) return;/);
 });
 
 test('plugin center protects the plugin used by the active task', () => {

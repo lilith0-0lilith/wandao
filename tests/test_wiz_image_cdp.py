@@ -80,8 +80,8 @@ class WizImageCdpTests(unittest.TestCase):
         self.assertEqual(len(saver.failures), 1)
 
     def test_browser_helper_version_is_bumped_for_new_image_loader(self):
-        self.assertIn("version === 8", WIZ_HELPER_JS)
-        self.assertIn("version: 8", WIZ_HELPER_JS)
+        self.assertIn("version === 10", WIZ_HELPER_JS)
+        self.assertIn("version: 10", WIZ_HELPER_JS)
         self.assertIn("AbortController", WIZ_HELPER_JS)
         self.assertIn("cancelImageLoad", WIZ_HELPER_JS)
 

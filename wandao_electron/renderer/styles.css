@@ -2778,6 +2778,12 @@ button,
   justify-content: flex-end;
 }
 
+.task-history-locate-note,
+.task-history-locate-source {
+  text-decoration: underline;
+  text-underline-offset: 2px;
+}
+
 /* Log dock */
 .log-section {
   height: 274px;

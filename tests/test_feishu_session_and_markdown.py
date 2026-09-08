@@ -361,6 +361,8 @@ class FeishuAuthRetryTests(unittest.TestCase):
         self.assertIn("res.redirected", loader)
         self.assertIn("/\\/accounts\\/page\\/login/i", loader)
         self.assertIn("new URL(res.url, location.origin).pathname", loader)
+        self.assertIn("attempt < 3", loader)
+        self.assertIn("setTimeout(resolve, 800)", loader)
 
 
 class FeishuImportProbeSessionTests(unittest.TestCase):
@@ -743,6 +745,29 @@ class FeishuImageLocalizationTests(unittest.TestCase):
         self.assertEqual(len(failures), 1)
         self.assertNotIn(resource, markdown)
 
+    def test_localize_images_attaches_document_url_to_failures(self) -> None:
+        resource = "feishu-media://image-token"
+        with tempfile.TemporaryDirectory() as directory:
+            md_path = Path(directory) / "document.md"
+            args = argparse.Namespace(_feishu_openapi_access_token="tenant-token", log_callback=None)
+            with (
+                mock.patch.object(feishu, "download_feishu_openapi_media", side_effect=feishu.ExportError("denied")),
+                mock.patch.object(feishu, "emit"),
+            ):
+                _markdown, success, failures = feishu.localize_images(
+                    FakeSessionCdp(),
+                    f"![image]({resource})",
+                    [resource],
+                    md_path,
+                    timeout=5,
+                    keep_remote=True,
+                    args=args,
+                    document_url=ENTRY_URL,
+                )
+
+        self.assertEqual(success, 0)
+        self.assertEqual(failures[0]["documentUrl"], ENTRY_URL)
+
     def test_localize_images_saves_browser_data_url(self) -> None:
         data_url = "data:image/png;base64,aW1hZ2U="
         cdp = FakeSessionCdp()
@@ -843,6 +868,31 @@ class FeishuOpenAPIBlockExportTests(unittest.TestCase):
         self.assertIn("- List item", result["markdown"])
         self.assertIn("![image](feishu-media://image-token)", result["markdown"])
         self.assertEqual(result["images"], ["feishu-media://image-token"])
+
+    def test_docx_blocks_keep_unknown_blocks_in_api_export(self) -> None:
+        blocks = [
+            {"block_id": "root", "block_type": 1, "children": ["text", "unknown"]},
+            {
+                "block_id": "text",
+                "parent_id": "root",
+                "block_type": 2,
+                "text": {"elements": [{"text_run": {"content": "Kept text"}}]},
+            },
+            {
+                "block_id": "unknown",
+                "parent_id": "root",
+                "block_type": 31,
+                "callout": {"content": "New block content"},
+            },
+        ]
+
+        result = feishu.feishu_docx_blocks_to_markdown(blocks, title="Document")
+
+        self.assertIn("Kept text", result["markdown"])
+        self.assertIn("New block content", result["markdown"])
+        self.assertIn("飞书块类型 31 尚未转换", result["markdown"])
+        self.assertEqual(result["unsupportedBlockTypes"], [31])
+        self.assertEqual(result["renderer"], "openapi_docx_partial")
 
     def test_docx_blocks_reject_orphaned_parent_instead_of_promoting_it_to_root(self) -> None:
         with self.assertRaisesRegex(feishu.FeishuOpenAPIBlocksUnsupported, "缺失的父节点"):
@@ -959,6 +1009,7 @@ class FeishuRelativeResourceReportingTests(unittest.TestCase):
         self.assertEqual(report["imageFailureCount"], 1)
         self.assertEqual(len(report["resourceFailures"]), 1)
         self.assertIn("assets/diagram.png", json.dumps(report["resourceFailures"], ensure_ascii=False))
+        self.assertIn(ENTRY_URL, json.dumps(report["resourceFailures"], ensure_ascii=False))
         self.assertEqual(len(checkpoint.failed_items), 1)
         self.assertEqual(checkpoint.completed_items, [])
         self.assertEqual(len(checkpoint.failed_tasks), 1)

@@ -29,8 +29,105 @@ class WizExportRegressionTests(unittest.TestCase):
         )
 
     def test_helper_version_is_bumped_for_diagnostic_protocol(self) -> None:
-        self.assertIn("version === 8", export_wiz.WIZ_HELPER_JS)
-        self.assertIn("version: 8", export_wiz.WIZ_HELPER_JS)
+        self.assertIn("version === 10", export_wiz.WIZ_HELPER_JS)
+        self.assertIn("version: 10", export_wiz.WIZ_HELPER_JS)
+
+    def test_empty_virtual_list_index_is_not_cached_before_rows_load(self) -> None:
+        self.assertIn("if (Object.keys(result).length) window.__wandaoWizDocumentIndex = result;", export_wiz.WIZ_HELPER_JS)
+
+    def test_helper_can_focus_a_document_by_its_stable_id(self) -> None:
+        self.assertIn("const focusDocument", export_wiz.WIZ_HELPER_JS)
+        self.assertIn("focusDocument,", export_wiz.WIZ_HELPER_JS)
+
+    def test_locate_document_rejects_an_invalid_document_id_before_opening_browser(self) -> None:
+        args = argparse.Namespace(locate_doc="not a valid id", locate_kb="", close_started_chrome=False)
+        with patch.object(export_wiz, "connect_wiz_browser") as connect:
+            with self.assertRaisesRegex(export_wiz.ExportError, "有效的文档 ID"):
+                export_wiz.locate_wiz_document(args)
+        connect.assert_not_called()
+
+    def test_locate_document_opens_only_a_verified_note(self) -> None:
+        doc = export_wiz.WizDoc("kb-123", "doc-123", "目标笔记", "/", "note", "", 0, 0, {})
+
+        class FakeCdp:
+            def __init__(self) -> None:
+                self.expressions = []
+                self.closed = False
+
+            def evaluate(self, expression, timeout=0):
+                self.expressions.append((expression, timeout))
+                if "focusDocument" in expression:
+                    return {"selected": True, "title": "目标笔记", "documentId": "doc-123"}
+                return True
+
+            def close(self) -> None:
+                self.closed = True
+
+        cdp = FakeCdp()
+        args = argparse.Namespace(locate_doc="doc-123", locate_kb="kb-123", close_started_chrome=False)
+        with (
+            patch.object(export_wiz, "connect_wiz_browser", return_value=(cdp, None)),
+            patch.object(export_wiz, "wait_for_login_state", return_value={"docs": [doc.raw | {"docGuid": doc.doc_guid, "kbGuid": doc.kb_guid, "title": doc.title}]}),
+            patch.object(export_wiz, "emit"),
+        ):
+            result = export_wiz.locate_wiz_document(args)
+
+        self.assertTrue(result["success"])
+        self.assertEqual(result["documentId"], "doc-123")
+        self.assertTrue(cdp.closed)
+        self.assertTrue(any("focusDocument" in expression for expression, _ in cdp.expressions))
+
+    def test_locate_document_keeps_a_browser_it_started_open(self) -> None:
+        doc = export_wiz.WizDoc("kb-123", "doc-123", "目标笔记", "/", "note", "", 0, 0, {})
+
+        class FakeCdp:
+            def evaluate(self, expression, timeout=0):
+                if "focusDocument" in expression:
+                    return {"selected": True, "title": "目标笔记", "documentId": "doc-123"}
+                return True
+
+            def close(self) -> None:
+                pass
+
+        class FakeProcess:
+            def __init__(self) -> None:
+                self.terminated = False
+
+            def terminate(self) -> None:
+                self.terminated = True
+
+        browser = FakeProcess()
+        args = argparse.Namespace(locate_doc="doc-123", locate_kb="kb-123", close_started_chrome=True)
+        with (
+            patch.object(export_wiz, "connect_wiz_browser", return_value=(FakeCdp(), browser)),
+            patch.object(export_wiz, "wait_for_login_state", return_value={"docs": [doc.raw | {"docGuid": doc.doc_guid, "kbGuid": doc.kb_guid, "title": doc.title}]}),
+            patch.object(export_wiz, "emit"),
+        ):
+            export_wiz.locate_wiz_document(args)
+
+        self.assertFalse(browser.terminated)
+
+    def test_locate_document_starts_a_browser_outside_the_task_job(self) -> None:
+        doc = export_wiz.WizDoc("kb-123", "doc-123", "目标笔记", "/", "note", "", 0, 0, {})
+
+        class FakeCdp:
+            def evaluate(self, expression, timeout=0):
+                if "focusDocument" in expression:
+                    return {"selected": True, "title": "目标笔记", "documentId": "doc-123"}
+                return True
+
+            def close(self) -> None:
+                pass
+
+        args = argparse.Namespace(locate_doc="doc-123", locate_kb="kb-123", close_started_chrome=False)
+        with (
+            patch.object(export_wiz, "connect_wiz_browser", return_value=(FakeCdp(), None)) as connect,
+            patch.object(export_wiz, "wait_for_login_state", return_value={"docs": [doc.raw | {"docGuid": doc.doc_guid, "kbGuid": doc.kb_guid, "title": doc.title}]}),
+            patch.object(export_wiz, "emit"),
+        ):
+            export_wiz.locate_wiz_document(args)
+
+        connect.assert_called_once_with(args, force_new_page=True, keep_started_browser=True)
 
     def test_extract_dom_editor_html_requires_matching_title(self) -> None:
         editor_html = """
@@ -84,6 +181,43 @@ class WizExportRegressionTests(unittest.TestCase):
 
         self.assertEqual(redacted, "https://example.invalid/image.jpg")
         self.assertNotIn("tracking", redacted)
+
+    def test_resource_failure_uses_wiz_entry_instead_of_an_api_editor_url(self) -> None:
+        doc = export_wiz.WizDoc("kb value", "doc/value", "笔记", "/", "note", "", 0, 0, {})
+        with tempfile.TemporaryDirectory() as temp_dir:
+            saver = export_wiz.ResourceSaver(
+                None,
+                doc,
+                Path(temp_dir) / "笔记.md",
+                "https://as.wiz.cn/",
+                argparse.Namespace(request_delay=0, request_jitter=0),
+            )
+
+        self.assertEqual(saver.document_reference(), {
+            "documentUrl": export_wiz.WIZ_APP_URL,
+            "documentUrlKind": "platform_entry",
+            "documentUrlLabel": "打开为知笔记首页",
+            "documentId": "doc/value",
+            "knowledgeBaseId": "kb value",
+        })
+
+    def test_failed_collab_image_records_a_browser_safe_document_reference(self) -> None:
+        doc = export_wiz.WizDoc("kb", "doc", "笔记", "/", "note", "", 0, 0, {})
+        with tempfile.TemporaryDirectory() as temp_dir:
+            saver = export_wiz.ResourceSaver(
+                None,
+                doc,
+                Path(temp_dir) / "笔记.md",
+                "https://as.wiz.cn",
+                argparse.Namespace(request_delay=0, request_jitter=0),
+            )
+            with patch.object(saver, "fetch_trusted_image", side_effect=export_wiz.ExportError("图片响应 HTTP 404")):
+                result = saver.save_collab_image("resources/progress")
+
+        self.assertEqual(result, "https://as.wiz.cn/editor/kb/doc/resources/resources%2Fprogress")
+        self.assertEqual(saver.failures[0]["documentUrl"], export_wiz.WIZ_APP_URL)
+        self.assertEqual(saver.failures[0]["documentUrlKind"], "platform_entry")
+        self.assertEqual(saver.failures[0]["documentId"], "doc")
 
     def test_browser_image_fallback_reads_cdp_response_body(self) -> None:
         class FakeCdp:

@@ -187,6 +187,7 @@ test('B2 “远端内容不存在”排在图片规则之后，图片自身 404 
     categoryOf('图片下载失败：https://cdn.nlark.com/yuque/0/2024/png/a.png：HTTP 404'),
     '图片或附件下载失败'
   );
+  assert.equal(categoryOf('附件响应 HTTP 404'), '图片或附件下载失败');
 });
 
 // B3：任务运行时会在超长输出最前面拼

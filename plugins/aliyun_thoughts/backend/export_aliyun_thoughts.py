@@ -60,6 +60,7 @@ from typing import Any, Callable
 from wandao_core.checkpoint import add_checkpoint_args, open_checkpoint_from_args
 from wandao_cli import extend_arg_list_from_file
 from wandao_core.credentials import write_private_json
+from wandao_core.document_links import direct_document_reference
 from wandao_core.logging import WandaoLogger, print_text, structured_logs_enabled
 from wandao_core.report import finalize_report
 
@@ -2021,6 +2022,7 @@ def export_workspace(args: argparse.Namespace) -> dict[str, Any]:
             md_path.parent.mkdir(parents=True, exist_ok=True)
             doc_paths[doc.id] = existing_docs.get(doc.id, md_path)
             item_key = f"aliyun:doc:{doc.id}"
+            document_url = f"https://thoughts.aliyun.com/workspaces/{workspace_id}/docs/{doc.id}"
 
             if checkpoint and getattr(args, "resume", False) and not args.update_existing and checkpoint.item_status(item_key) == "completed":
                 skipped += 1
@@ -2039,7 +2041,7 @@ def export_workspace(args: argparse.Namespace) -> dict[str, Any]:
                     args,
                     f"开始导出文档：{doc.title}",
                     event="document.export.started",
-                    doc={"id": doc.id, "title": doc.title, "index": index, "path": str(md_path)},
+                    doc={"id": doc.id, "title": doc.title, "index": index, "path": str(md_path), **direct_document_reference(document_url, document_id=doc.id)},
                 )
                 if api_client and api_user_id:
                     try:
@@ -2060,7 +2062,7 @@ def export_workspace(args: argparse.Namespace) -> dict[str, Any]:
                 markdown = rewrite_internal_links(markdown, md_path, {**planned_doc_paths, **doc_paths})
                 markdown = append_child_doc_links(markdown, doc, children, {**planned_doc_paths, **doc_paths}, md_path)
                 if getattr(args, "include_source", True):
-                    markdown += f"\n---\n\n来源: https://thoughts.aliyun.com/workspaces/{workspace_id}/docs/{doc.id}\n"
+                    markdown += f"\n---\n\n来源: {document_url}\n"
                 markdown, count, img_errors = localize_images(
                     markdown,
                     result.get("images") or [],
@@ -2071,7 +2073,12 @@ def export_workspace(args: argparse.Namespace) -> dict[str, Any]:
                 )
                 image_success += count
                 if img_errors:
-                    image_failures.append({"document": doc.title, "path": str(md_path), "failures": img_errors})
+                    image_failures.append({
+                        "document": doc.title,
+                        "path": str(md_path),
+                        "failures": img_errors,
+                        **direct_document_reference(document_url, document_id=doc.id),
+                    })
                 md_path.write_text(markdown, encoding="utf-8")
                 doc_paths[doc.id] = md_path
                 if checkpoint:
@@ -2084,7 +2091,7 @@ def export_workspace(args: argparse.Namespace) -> dict[str, Any]:
                     args,
                     f"文档导出完成：{doc.title}",
                     event="document.export.completed",
-                    doc={"id": doc.id, "title": doc.title, "index": index, "path": str(md_path)},
+                    doc={"id": doc.id, "title": doc.title, "index": index, "path": str(md_path), **direct_document_reference(document_url, document_id=doc.id)},
                     stats={"imageSuccessInDoc": count, "imageFailuresInDoc": len(img_errors)},
                 )
             except ExportStopped:
@@ -2096,13 +2103,13 @@ def export_workspace(args: argparse.Namespace) -> dict[str, Any]:
             except Exception as exc:
                 if checkpoint:
                     checkpoint.fail_item(item_key, str(exc))
-                failures.append({"id": doc.id, "title": doc.title, "error": str(exc)})
+                failures.append({"id": doc.id, "title": doc.title, "error": str(exc), **direct_document_reference(document_url, document_id=doc.id)})
                 emit(
                     args,
                     f"文档导出失败：{doc.title}：{compact_error(exc, 360)}",
                     event="document.export.failed",
                     level="error",
-                    doc={"id": doc.id, "title": doc.title, "index": index, "path": str(md_path)},
+                    doc={"id": doc.id, "title": doc.title, "index": index, "path": str(md_path), **direct_document_reference(document_url, document_id=doc.id)},
                     error={"message": str(exc), "type": type(exc).__name__},
                 )
 

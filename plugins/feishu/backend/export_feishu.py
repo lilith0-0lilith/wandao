@@ -690,12 +690,54 @@ def feishu_docx_elements_to_markdown(elements: list[dict[str, Any]] | None) -> s
     return "".join(parts).strip()
 
 
-def _feishu_docx_block_text(block: dict[str, Any], host: str, images: list[str]) -> str:
+def _feishu_docx_unknown_block_text(block: dict[str, Any], block_type: int) -> str:
+    """Keep readable text from a newer block instead of forcing page fallback."""
+
+    chunks: list[str] = []
+    seen: set[str] = set()
+
+    def add(value: Any) -> None:
+        text = str(value or "").strip()
+        if text and text not in seen:
+            seen.add(text)
+            chunks.append(text)
+
+    def visit(value: Any) -> None:
+        if isinstance(value, dict):
+            text_run = value.get("text_run")
+            if isinstance(text_run, dict):
+                add(text_run.get("content"))
+                return
+            for key, child in value.items():
+                if key in {"token", "url", "id", "block_id", "parent_id", "children"}:
+                    continue
+                if key in {"content", "text", "title", "description", "name"} and isinstance(child, str):
+                    add(child)
+                elif isinstance(child, (dict, list)):
+                    visit(child)
+        elif isinstance(value, list):
+            for child in value:
+                visit(child)
+
+    visit(block)
+    marker = f"<!-- 飞书块类型 {block_type} 尚未转换 -->"
+    return "\n".join([*chunks, marker]) if chunks else marker
+
+
+def _feishu_docx_block_text(
+    block: dict[str, Any],
+    host: str,
+    images: list[str],
+    unsupported: list[int] | None = None,
+) -> str:
     try:
         block_type = int(block.get("block_type"))
     except (TypeError, ValueError) as exc:
         raise FeishuOpenAPIBlocksUnsupported("文档块缺少有效 block_type") from exc
     if block_type not in FEISHU_DOCX_SUPPORTED_BLOCK_TYPES:
+        if unsupported is not None:
+            unsupported.append(block_type)
+            return _feishu_docx_unknown_block_text(block, block_type)
         raise FeishuOpenAPIBlocksUnsupported(f"文档含有暂未转换的块类型：{block_type}")
     if block_type in {1, 34}:
         return ""
@@ -786,6 +828,7 @@ def feishu_docx_blocks_to_markdown(
         raise FeishuOpenAPIBlocksUnsupported("文档块树没有可用根节点")
     host = urllib.parse.urlparse(source_url).netloc
     images: list[str] = []
+    unsupported: list[int] = []
     visited: set[str] = set()
     visiting: set[str] = set()
 
@@ -813,7 +856,7 @@ def feishu_docx_blocks_to_markdown(
             block_type = int(block.get("block_type"))
         except (TypeError, ValueError) as exc:
             raise FeishuOpenAPIBlocksUnsupported("文档块缺少有效 block_type") from exc
-        own = _feishu_docx_block_text(block, host, images)
+        own = _feishu_docx_block_text(block, host, images, unsupported)
         if block_type == 1:
             parts = render_children(block)
         elif block_type == 34:
@@ -835,13 +878,15 @@ def feishu_docx_blocks_to_markdown(
         raise FeishuOpenAPIBlocksUnsupported("文档块树存在未连接节点")
     body = "\n\n".join(part for part in rendered if part).strip()
     markdown = f"# {title}\n" + (f"\n{body}\n" if body else "")
+    unique_unsupported = list(dict.fromkeys(unsupported))
     return {
         "title": title,
         "markdown": markdown,
         "images": list(dict.fromkeys(images)),
         "blockCount": len(blocks),
         "textLength": len(body),
-        "renderer": "openapi_docx",
+        "renderer": "openapi_docx_partial" if unique_unsupported else "openapi_docx",
+        "unsupportedBlockTypes": unique_unsupported,
     }
 
 
@@ -935,11 +980,16 @@ async (startToken) => {
 
   let spaceId = "";
   let bootstrapError = null;
-  try {
-    const node = await getJson(`/space/api/wiki/v2/tree/get_node/?wiki_token=${encodeURIComponent(startToken)}&space_id=&expand_shortcut=true&with_deleted=true`);
-    spaceId = node && node.data && node.data.space_id || "";
-  } catch (error) {
-    bootstrapError = error;
+  for (let attempt = 0; attempt < 3 && !spaceId; attempt += 1) {
+    try {
+      const node = await getJson(`/space/api/wiki/v2/tree/get_node/?wiki_token=${encodeURIComponent(startToken)}&space_id=&expand_shortcut=true&with_deleted=true`);
+      spaceId = node && node.data && node.data.space_id || "";
+      bootstrapError = null;
+    } catch (error) {
+      bootstrapError = error;
+      if (/FEISHU_AUTH_REQUIRED|FEISHU_PERMISSION_DENIED/.test(String(error))) break;
+    }
+    if (!spaceId && attempt < 2) await new Promise(resolve => setTimeout(resolve, 800));
   }
   if (!spaceId) {
     const entry = performance.getEntriesByType("resource")
@@ -2267,16 +2317,25 @@ def fetch_doc_markdown(
     throttle_request(args)
     openapi_result = try_extract_doc_markdown_via_openapi(node, args)
     if openapi_result is not None:
-        emit(
-            args,
-            f"飞书文档已通过官方块 API 完整读取：{node.get('title') or '未命名'}",
-            event="document.export.renderer",
-            renderer="openapi_docx",
-            stats={
-                "blockCount": openapi_result.get("blockCount"),
-                "textLength": openapi_result.get("textLength"),
-            },
-        )
+        renderer = openapi_result.get("renderer")
+        if renderer == "openapi_docx_partial":
+            unsupported = ", ".join(str(item) for item in openapi_result.get("unsupportedBlockTypes") or [])
+            emit(
+                args,
+                f"飞书块 API 已完成读取“{node.get('title') or '未命名'}”，部分块类型以占位符保留：{unsupported}",
+                level="warn",
+            )
+        else:
+            emit(
+                args,
+                f"飞书文档已通过官方块 API 完整读取：{node.get('title') or '未命名'}",
+                event="document.export.renderer",
+                renderer="openapi_docx",
+                stats={
+                    "blockCount": openapi_result.get("blockCount"),
+                    "textLength": openapi_result.get("textLength"),
+                },
+            )
         return openapi_result
     url = node.get("url") or ""
     if not url:
@@ -2469,6 +2528,7 @@ def localize_images(
     timeout: int,
     keep_remote: bool,
     args: argparse.Namespace | None = None,
+    document_url: str = "",
 ) -> tuple[str, int, list[dict[str, str]]]:
     cookies: list[dict[str, Any]] | None = None
     openapi_access_token: str | None = None
@@ -2500,7 +2560,7 @@ def localize_images(
             markdown = markdown.replace(url, os.path.relpath(target, md_path.parent).replace("\\", "/"))
             success += 1
         except Exception as exc:
-            failures.append({"url": url, "error": str(exc)})
+            failures.append({"url": url, "error": str(exc), **({"documentUrl": document_url} if document_url else {})})
             emit(
                 args,
                 f"图片下载失败：{url[:160]}：{exc}",
@@ -2508,6 +2568,7 @@ def localize_images(
                 level="error",
                 step="download_image",
                 resource={"type": "image", "url": url, "host": urllib.parse.urlparse(url).netloc},
+                doc={"url": document_url} if document_url else None,
                 error={"type": type(exc).__name__, "message": str(exc)},
             )
             # feishu-media:// is an internal marker rather than a remotely
@@ -2825,11 +2886,12 @@ def export_wiki(args: argparse.Namespace) -> dict[str, Any]:
             try:
                 if checkpoint:
                     checkpoint.start_item(item_key, "content")
+                document_url = str(doc.get("url") or origin + "/wiki/" + token)
                 emit(
                     args,
                     f"开始导出文档：{doc.get('title') or token}",
                     event="document.export.started",
-                    doc={"id": token, "title": doc.get("title") or "", "index": index, "path": str(md_path)},
+                    doc={"id": token, "title": doc.get("title") or "", "url": document_url, "index": index, "path": str(md_path)},
                 )
                 result = prefetched_results.pop(token, None) or run_with_auth_retry(
                     cdp,
@@ -2854,6 +2916,7 @@ def export_wiki(args: argparse.Namespace) -> dict[str, Any]:
                     args.download_timeout,
                     args.keep_remote_images,
                     args,
+                    document_url=document_url,
                 )
                 relative_resources = [
                     str(resource).strip()
@@ -2863,6 +2926,7 @@ def export_wiki(args: argparse.Namespace) -> dict[str, Any]:
                 relative_errors = [
                     {
                         "url": resource,
+                        "documentUrl": document_url,
                         "error": "源 Markdown 引用的相对资源未随飞书 Wiki 节点提供",
                     }
                     for resource in dict.fromkeys(relative_resources)
@@ -2875,12 +2939,18 @@ def export_wiki(args: argparse.Namespace) -> dict[str, Any]:
                         event="resource.download.failed",
                         level="warn",
                         step="resolve_relative_resource",
-                        doc={"id": token, "title": doc.get("title") or "", "path": str(md_path)},
+                        doc={"id": token, "title": doc.get("title") or "", "url": document_url, "path": str(md_path)},
                         stats={"relativeResourceFailures": len(relative_errors)},
                     )
                 image_success += count
                 if img_errors:
-                    image_failures.append({"document": doc.get("title"), "path": str(md_path), "failures": img_errors})
+                    image_failures.append({
+                        "document": doc.get("title"),
+                        "documentUrl": document_url,
+                        "wiki_token": token,
+                        "path": str(md_path),
+                        "failures": img_errors,
+                    })
                 md_path.parent.mkdir(parents=True, exist_ok=True)
                 md_path.write_text(markdown, encoding="utf-8")
                 incomplete = bool(result.get("incomplete"))
@@ -2888,6 +2958,7 @@ def export_wiki(args: argparse.Namespace) -> dict[str, Any]:
                     failures.append(
                         {
                             "title": doc.get("title") or "",
+                            "documentUrl": document_url,
                             "wiki_token": token,
                             "error": "飞书原始 Markdown 下载失败，已保留页面预览兜底内容，但内容可能不完整"
                             if result.get("renderer") == "markdown_preview_fallback"
@@ -2917,7 +2988,7 @@ def export_wiki(args: argparse.Namespace) -> dict[str, Any]:
                     ),
                     event="document.export.completed",
                     level="warn" if incomplete or img_errors else "success",
-                    doc={"id": token, "title": doc.get("title") or "", "index": index, "path": str(md_path)},
+                    doc={"id": token, "title": doc.get("title") or "", "url": document_url, "index": index, "path": str(md_path)},
                     stats={
                         "imageSuccessInDoc": count,
                         "imageFailuresInDoc": len(img_errors),
@@ -2938,13 +3009,18 @@ def export_wiki(args: argparse.Namespace) -> dict[str, Any]:
             except Exception as exc:
                 if checkpoint:
                     checkpoint.fail_item(item_key, str(exc))
-                failures.append({"title": doc.get("title") or "", "wiki_token": token, "error": str(exc)})
+                failures.append({
+                    "title": doc.get("title") or "",
+                    "documentUrl": document_url,
+                    "wiki_token": token,
+                    "error": str(exc),
+                })
                 emit(
                     args,
                     f"文档导出失败：{doc.get('title') or token}：{exc}",
                     event="document.export.failed",
                     level="error",
-                    doc={"id": token, "title": doc.get("title") or "", "index": index, "path": str(md_path)},
+                    doc={"id": token, "title": doc.get("title") or "", "url": document_url, "index": index, "path": str(md_path)},
                     error={"type": type(exc).__name__, "message": str(exc)},
                 )
 

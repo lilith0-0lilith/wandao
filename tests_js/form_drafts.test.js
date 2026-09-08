@@ -55,6 +55,21 @@ test('drafts retain regular inputs and checkbox state', () => {
   assert.equal(delay.value, '0.5');
 });
 
+test('URL fields remain draftable when their placeholder mentions a token', () => {
+  const storage = memoryStorage();
+  const source = field({
+    id: 'feishu-export-url',
+    value: 'https://tenant.feishu.cn/wiki/abc123',
+    placeholder: 'https://<tenant>.feishu.cn/wiki/<token>'
+  });
+  const saved = drafts.saveDraft(storage, 'feishu-export', 'export', form([source]), 100);
+  assert.deepEqual(saved, { saved: true, fieldCount: 1 });
+  const output = field({ id: 'feishu-export-url', placeholder: source.placeholder, value: '' });
+  const restored = drafts.restoreDraft(storage, 'feishu-export', 'export', form([output]));
+  assert.equal(restored.restored, 1);
+  assert.equal(output.value, source.value);
+});
+
 test('drafts never persist credential-like fields, even when type is text', () => {
   const storage = memoryStorage();
   const source = form([
