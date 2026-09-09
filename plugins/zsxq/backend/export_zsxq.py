@@ -21,6 +21,13 @@ when a topic page points to a full article.
 
 from __future__ import annotations
 
+import sys as _sys
+from pathlib import Path as _Path
+
+_REPO_ROOT = _Path(__file__).resolve().parents[3]
+if str(_REPO_ROOT) not in _sys.path:
+    _sys.path.insert(0, str(_REPO_ROOT))
+
 import argparse
 import html
 import json
@@ -62,6 +69,7 @@ from wandao_core.browser import (
 )
 from wandao_core.report import finalize_report
 from wandao_core.checkpoint import CheckpointLeaseLostError, WandaoCheckpoint
+from wandao_core.output_layout import add_output_layout_args, resolve_output_directory
 from wandao_core.credentials import write_private_json
 from wandao_core.document_links import direct_document_reference
 
@@ -3860,8 +3868,9 @@ def finish_checkpoint_task_safely(
 def export_entry(args: argparse.Namespace) -> dict[str, Any]:
     entry_url = normalize_entry_url(args.entry_url)
     is_group_export = is_group_entry_url(entry_url)
-    output = Path(args.output).resolve()
-    output.mkdir(parents=True, exist_ok=True)
+    output_root = Path(args.output).resolve()
+    output = output_root
+    output_root.mkdir(parents=True, exist_ok=True)
     checkpoint: WandaoCheckpoint | None = None
     checkpoint_file = str(getattr(args, "checkpoint_file", "") or "").strip()
     if checkpoint_file:
@@ -3925,7 +3934,7 @@ def export_entry(args: argparse.Namespace) -> dict[str, Any]:
                 task_metadata.update({
                     "groupId": task_group_id,
                     "groupScope": task_group_scope,
-                    "resumeKey": zsxq_group_resume_key(task_group_id, task_group_scope, output),
+                    "resumeKey": zsxq_group_resume_key(task_group_id, task_group_scope, output_root),
                 })
         checkpoint.start_task(task_metadata)
         # 429/1059 backoff can intentionally exceed the five-minute task lease.
@@ -3972,7 +3981,7 @@ def export_entry(args: argparse.Namespace) -> dict[str, Any]:
                     group_scope = group_scope_from_args(entry_url, args)
                     group_page_size = normalize_group_page_size(args)
                     group_max_pages = normalize_group_max_pages(args, args.limit, group_page_size)
-                    group_resume_key = zsxq_group_resume_key(group_id, group_scope, output)
+                    group_resume_key = zsxq_group_resume_key(group_id, group_scope, output_root)
                     if not entry_page_loaded:
                         navigate_with_retry(cdp, entry_url, args)
                         entry_page_loaded = True
@@ -4036,6 +4045,27 @@ def export_entry(args: argparse.Namespace) -> dict[str, Any]:
             links = filter_follow_zsxq_links(entry.get("zsxqLinks") or [], args)
             if args.limit and args.limit > 0 and not use_toc:
                 links = links[: args.limit]
+        source_name = str(
+            (toc.get("title") if use_toc else entry.get("title"))
+            or "知识星球"
+        ).strip()
+        source_id = str(
+            (toc.get("groupId") if use_group_topics else "")
+            or (topic_id_from_url(entry_url) if is_single_topic_entry_url(entry_url) else entry_url)
+        )
+        output = resolve_output_directory(
+            output_root,
+            source_name,
+            source_id,
+            auto_output_folder=bool(getattr(args, "auto_output_folder", False)),
+            preserve_legacy=bool(getattr(args, "incremental", False) or getattr(args, "resume", False) or getattr(args, "retry_failed", False)),
+            fallback="知识星球",
+        )
+        if use_group_topics and group_id:
+            # Keep cursor identity tied to the user-selected root.  The final
+            # source directory is a presentation detail and must not strand
+            # existing group checkpoints during a layout upgrade.
+            group_resume_key = zsxq_group_resume_key(group_id, group_scope, output_root)
         existing = scan_exported_docs(output)
         existing_topic_ids = scan_exported_topic_ids(output)
         exported_rows: list[dict[str, Any]] = []
@@ -5829,6 +5859,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--scan-toc", action="store_true", help="Read the left ZSXQ directory and print it as JSON, without exporting")
     parser.add_argument("--entry-url", help="ZSXQ column/topic/article URL")
     parser.add_argument("--output", help="Output directory")
+    add_output_layout_args(parser)
     parser.add_argument("--port", type=int, default=DEFAULT_ZSXQ_PORT, help="Chrome remote debugging port")
     parser.add_argument("--profile-dir", help=f"Chrome profile dir. Omit to auto-use {default_profile_path()}")
     parser.add_argument("--browser-path", help="Optional Chrome/Edge/Chromium executable path")

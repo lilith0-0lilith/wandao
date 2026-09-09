@@ -10,6 +10,13 @@ not passwords.
 
 from __future__ import annotations
 
+import sys as _sys
+from pathlib import Path as _Path
+
+_REPO_ROOT = _Path(__file__).resolve().parents[3]
+if str(_REPO_ROOT) not in _sys.path:
+    _sys.path.insert(0, str(_REPO_ROOT))
+
 import argparse
 import gzip
 import hashlib
@@ -31,6 +38,7 @@ from pathlib import Path
 from typing import Any
 
 from wandao_core.checkpoint import add_checkpoint_args, open_checkpoint_from_args
+from wandao_core.output_layout import add_output_layout_args, resolve_output_directory
 from wandao_cli import extend_arg_list_from_file
 from wandao_core.credentials import write_private_json
 from wandao_core.logging import emit_legacy
@@ -550,6 +558,10 @@ def build_remote_tree(client: YoudaoClient) -> tuple[list[RemoteNode], str]:
     root = client.root_info()
     root_entry = file_entry(root)
     root_id = entry_id(root_entry)
+    try:
+        setattr(client, "_wandao_root_name", entry_name(root_entry))
+    except Exception:
+        pass
     if not root_id:
         raise YoudaoError("没有读取到有道云根目录 ID，可能是登录已失效。")
 
@@ -1140,13 +1152,22 @@ def emit_progress(
 
 
 def export_youdao(args: argparse.Namespace) -> dict[str, Any]:
-    output = Path(args.output).expanduser().resolve()
-    output.mkdir(parents=True, exist_ok=True)
+    output_root = Path(args.output).expanduser().resolve()
+    output = output_root
+    output_root.mkdir(parents=True, exist_ok=True)
     checkpoint = open_checkpoint_from_args(args, "youdao", "export")
     client: YoudaoClient | None = None
     try:
         client = YoudaoClient(auth_path_from_args(args), args)
         nodes, root_id = build_remote_tree(client)
+        output = resolve_output_directory(
+            output_root,
+            str(getattr(client, "_wandao_root_name", "") or "有道云笔记"),
+            root_id,
+            auto_output_folder=bool(getattr(args, "auto_output_folder", False)),
+            preserve_legacy=bool(getattr(args, "incremental", False) or getattr(args, "resume", False) or getattr(args, "retry_failed", False)),
+            fallback="有道云笔记",
+        )
     except ExportStopped as exc:
         report = {
             "provider": "youdao",
@@ -1450,6 +1471,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--incremental", action="store_true", help="已有文件则跳过")
     parser.add_argument("--update-existing", action="store_true", help="配合 --incremental 时也更新已有文件")
     add_checkpoint_args(parser)
+    add_output_layout_args(parser)
     parser.add_argument("--progress-every", type=int, default=1, help="每处理多少篇输出一次进度")
     parser.add_argument("--request-delay", type=float, default=0.8, help="每次请求前固定等待秒数")
     parser.add_argument("--request-jitter", type=float, default=0.4, help="每次请求额外随机等待秒数")

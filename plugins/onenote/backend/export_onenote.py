@@ -9,6 +9,13 @@ in Python.
 
 from __future__ import annotations
 
+import sys as _sys
+from pathlib import Path as _Path
+
+_REPO_ROOT = _Path(__file__).resolve().parents[3]
+if str(_REPO_ROOT) not in _sys.path:
+    _sys.path.insert(0, str(_REPO_ROOT))
+
 import argparse
 import base64
 import hashlib
@@ -33,6 +40,7 @@ from typing import Any
 from xml.etree import ElementTree as ET
 
 from wandao_core.checkpoint import add_checkpoint_args, open_checkpoint_from_args
+from wandao_core.output_layout import add_output_layout_args, resolve_output_directory
 from wandao_cli import extend_arg_list_from_file
 from wandao_core.logging import emit_legacy
 from wandao_core.report import finalize_report
@@ -953,7 +961,17 @@ def is_onenote_service_unavailable(result: dict[str, str]) -> bool:
 
 
 def export_onenote(args: argparse.Namespace, nodes: list[TocNode], pages: list[TocNode]) -> dict[str, Any]:
-    output = Path(args.output).expanduser().resolve() if args.output else default_output_dir()
+    output_root = Path(args.output).expanduser().resolve() if args.output else default_output_dir()
+    notebooks = [node for node in nodes if node.type == "notebook"]
+    source_node = notebooks[0] if len(notebooks) == 1 else None
+    output = resolve_output_directory(
+        output_root,
+        source_node.title if source_node else "OneNote",
+        source_node.id if source_node else "onenote",
+        auto_output_folder=bool(getattr(args, "auto_output_folder", False)),
+        preserve_legacy=bool(getattr(args, "incremental", False) or getattr(args, "resume", False) or getattr(args, "retry_failed", False)),
+        fallback="OneNote",
+    )
     output.mkdir(parents=True, exist_ok=True)
     # OneNote can take several minutes to recover its COM server.  Each page
     # still renews the lease, while the longer lease protects one slow call.
@@ -1217,6 +1235,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--doc-id-file", default="", help="从文件读取要导出的页面 ID，JSON 数组或逐行文本均可")
     parser.add_argument("--incremental", action="store_true", help="目标 Markdown 已存在时跳过")
     add_checkpoint_args(parser)
+    add_output_layout_args(parser)
     parser.add_argument("--progress-every", type=int, default=1, help="每处理多少篇输出一次进度")
     parser.add_argument("--request-delay", default="0", help=argparse.SUPPRESS)
     parser.add_argument("--request-jitter", default="0", help=argparse.SUPPRESS)

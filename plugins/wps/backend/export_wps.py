@@ -8,6 +8,13 @@ stdout; human-readable prompts/errors use stderr.
 """
 from __future__ import annotations
 
+import sys as _sys
+from pathlib import Path as _Path
+
+_REPO_ROOT = _Path(__file__).resolve().parents[3]
+if str(_REPO_ROOT) not in _sys.path:
+    _sys.path.insert(0, str(_REPO_ROOT))
+
 import argparse
 import base64
 import binascii
@@ -46,6 +53,7 @@ from wandao_core.browser import (
     wait_for_debug_port,
 )
 from wandao_core.checkpoint import add_checkpoint_args, open_checkpoint_from_args
+from wandao_core.output_layout import add_output_layout_args, resolve_output_directory
 from wandao_core.credentials import write_private_json
 from wandao_core.report import finalize_report
 
@@ -1440,13 +1448,22 @@ def scan_wps(args: argparse.Namespace) -> dict[str, Any]:
 
 
 def export_wps(args: argparse.Namespace) -> dict[str, Any]:
-    output = Path(args.output).expanduser().resolve()
+    output_root = Path(args.output).expanduser().resolve()
     checkpoint = open_checkpoint_from_args(args, "wps-export", "export")
     cdp = process = None
     try:
         cdp, process = connect_wps_browser(args)
         load_auth_state(cdp, getattr(args, "auth_file", None))
         source = WPSDocumentDataSource(transport=CDPJSONTransport(cdp), request_delay=args.request_delay, sleep=time.sleep)
+        root = source.get_root()
+        output = resolve_output_directory(
+            output_root,
+            str(root.get("title") or "WPS 文档"),
+            str(root.get("id") or WPS_DOCUMENT_ROOT_ID),
+            auto_output_folder=bool(getattr(args, "auto_output_folder", False)),
+            preserve_legacy=bool(getattr(args, "incremental", False) or getattr(args, "resume", False) or getattr(args, "retry_failed", False)),
+            fallback="WPS 文档",
+        )
         task = WPSExportTask(source, output, checkpoint=checkpoint, args=args)
         result = task.export(task.scan(), args.selected_file_ids, args.retry_failed)
         _write_report(result, task.report_file)
@@ -1472,6 +1489,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--request-delay", type=float, default=0.1)
     parser.add_argument("--progress-every", type=int, default=1, help="每处理多少篇刷新一次进度")
     add_checkpoint_args(parser)
+    add_output_layout_args(parser)
     return parser
 
 

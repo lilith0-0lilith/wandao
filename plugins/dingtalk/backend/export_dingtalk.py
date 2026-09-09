@@ -8,6 +8,13 @@ browser; the small local auth summary only records that the profile was checked.
 
 from __future__ import annotations
 
+import sys as _sys
+from pathlib import Path as _Path
+
+_REPO_ROOT = _Path(__file__).resolve().parents[3]
+if str(_REPO_ROOT) not in _sys.path:
+    _sys.path.insert(0, str(_REPO_ROOT))
+
 import argparse
 import base64
 import hashlib
@@ -43,6 +50,7 @@ from wandao_core.browser import (
     wait_for_debug_port,
 )
 from wandao_core.checkpoint import add_checkpoint_args, open_checkpoint_from_args
+from wandao_core.output_layout import add_output_layout_args, resolve_output_directory
 from wandao_core.credentials import write_private_json
 from wandao_core.report import finalize_report
 
@@ -1081,8 +1089,9 @@ def scan_dingtalk(args: argparse.Namespace) -> dict[str, Any]:
 
 
 def export_dingtalk(args: argparse.Namespace) -> dict[str, Any]:
-    output = Path(args.output).expanduser().resolve()
-    output.mkdir(parents=True, exist_ok=True)
+    output_root = Path(args.output).expanduser().resolve()
+    output = output_root
+    output_root.mkdir(parents=True, exist_ok=True)
     started = time.time()
     checkpoint = open_checkpoint_from_args(args, "dingtalk-export", "export")
     cdp, process = connect_dingtalk_browser(args, args.source_url or ENTRY_URL)
@@ -1099,6 +1108,16 @@ def export_dingtalk(args: argparse.Namespace) -> dict[str, Any]:
                 event="toc.cache.hit",
                 stats={"discovered": len(entries)},
             )
+        roots = [entry for entry in entries if not entry.parent_uuid]
+        source_entry = roots[0] if roots else (entries[0] if entries else None)
+        output = resolve_output_directory(
+            output_root,
+            source_entry.title if source_entry else "钉钉文档",
+            source_entry.uuid if source_entry else (args.source_url or "dingtalk"),
+            auto_output_folder=bool(getattr(args, "auto_output_folder", False)),
+            preserve_legacy=bool(getattr(args, "incremental", False) or getattr(args, "resume", False) or getattr(args, "retry_failed", False)),
+            fallback="钉钉文档",
+        )
         by_uuid = {entry.uuid: entry for entry in entries}
         documents = select_entries(entries, selected_ids)
         paths = {entry.uuid: relative_document_path(by_uuid, entry, output) for entry in documents}
@@ -1236,6 +1255,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--doc-id-file", default="", help="从 JSON 数组或逐行文件读取文档 ID")
     parser.add_argument("--incremental", action="store_true", help="目标 Markdown 已存在时跳过")
     add_checkpoint_args(parser)
+    add_output_layout_args(parser)
     parser.add_argument("--port", type=int, default=DEFAULT_PORT, help="Chrome 调试端口")
     parser.add_argument("--profile-dir", default=str(default_profile_path()), help="钉钉专用浏览器配置目录")
     parser.add_argument("--browser-path", default="", help="Chrome/Edge 可执行文件路径")

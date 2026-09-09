@@ -9,6 +9,13 @@ account password or Wiz token to Wandao config files.
 
 from __future__ import annotations
 
+import sys as _sys
+from pathlib import Path as _Path
+
+_REPO_ROOT = _Path(__file__).resolve().parents[3]
+if str(_REPO_ROOT) not in _sys.path:
+    _sys.path.insert(0, str(_REPO_ROOT))
+
 import argparse
 import base64
 import hashlib
@@ -42,6 +49,7 @@ from wandao_core.browser import (
     wait_for_debug_port,
 )
 from wandao_core.checkpoint import add_checkpoint_args, open_checkpoint_from_args
+from wandao_core.output_layout import add_output_layout_args, resolve_output_directory
 from wandao_cli import extend_arg_list_from_file
 from wandao_core.credentials import write_private_json
 from wandao_core.report import finalize_report
@@ -2078,8 +2086,9 @@ def export_doc_with_page_recovery(
 
 def export_wiz(args: argparse.Namespace) -> dict[str, Any]:
     started = time.time()
-    output = Path(args.output).resolve()
-    output.mkdir(parents=True, exist_ok=True)
+    output_root = Path(args.output).resolve()
+    output = output_root
+    output_root.mkdir(parents=True, exist_ok=True)
     checkpoint = open_checkpoint_from_args(args, "wiz", "export")
 
     cdp, chrome_proc = connect_wiz_browser(args)
@@ -2089,6 +2098,22 @@ def export_wiz(args: argparse.Namespace) -> dict[str, Any]:
         docs = docs_from_snapshot(snapshot)
         selected_ids = set(args.selected_doc_ids or [])
         docs = select_wiz_documents(docs, selected_ids)
+        account = snapshot.get("account") or {}
+        kbs = snapshot.get("kbs") or []
+        kb_id = str(account.get("kbGuid") or (kbs[0].get("kbGuid") if kbs and isinstance(kbs[0], dict) else ""))
+        kb_name = ""
+        for kb in kbs:
+            if isinstance(kb, dict) and str(kb.get("kbGuid") or "") == kb_id:
+                kb_name = str(kb.get("name") or "")
+                break
+        output = resolve_output_directory(
+            output_root,
+            kb_name or "为知笔记",
+            kb_id or WIZ_APP_URL,
+            auto_output_folder=bool(getattr(args, "auto_output_folder", False)),
+            preserve_legacy=bool(getattr(args, "incremental", False) or getattr(args, "resume", False) or getattr(args, "retry_failed", False)),
+            fallback="为知笔记",
+        )
         planner = PathPlanner(output)
         doc_paths = {doc.doc_guid: planner.markdown_path(doc) for doc in docs}
         # A checkpoint can recover an abandoned task by changing its old
@@ -2342,6 +2367,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--doc-id-file", default="", help="从文件读取要导出的笔记 ID，JSON 数组或逐行文本均可")
     parser.add_argument("--incremental", action="store_true", help="目标 Markdown 已存在时跳过")
     add_checkpoint_args(parser)
+    add_output_layout_args(parser)
     parser.add_argument("--port", type=int, default=DEFAULT_PORT, help="Chrome 调试端口")
     parser.add_argument("--profile-dir", default=str(default_profile_path()), help="浏览器配置目录")
     parser.add_argument("--browser-path", default="", help="Chrome/Edge 可执行文件路径")

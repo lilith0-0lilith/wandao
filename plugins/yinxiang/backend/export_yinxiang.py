@@ -7,6 +7,13 @@ Author: tllovesxs
 
 from __future__ import annotations
 
+import sys as _sys
+from pathlib import Path as _Path
+
+_REPO_ROOT = _Path(__file__).resolve().parents[3]
+if str(_REPO_ROOT) not in _sys.path:
+    _sys.path.insert(0, str(_REPO_ROOT))
+
 import argparse
 import base64
 import getpass
@@ -25,6 +32,7 @@ from typing import Any
 from xml.etree import ElementTree as ET
 
 from wandao_core.checkpoint import add_checkpoint_args, open_checkpoint_from_args
+from wandao_core.output_layout import add_output_layout_args, resolve_output_directory
 from wandao_cli import extend_arg_list_from_file
 from wandao_core.logging import emit_legacy
 from wandao_core.report import finalize_report
@@ -690,6 +698,14 @@ def write_index(output: Path, md_files: list[Path]) -> None:
 def run_export(args: argparse.Namespace) -> dict[str, Any]:
     if not args.no_sync:
         sync_notes(args)
+    args.output = resolve_output_directory(
+        args.output,
+        "印象笔记",
+        str(args.database),
+        auto_output_folder=bool(getattr(args, "auto_output_folder", False)),
+        preserve_legacy=bool(getattr(args, "incremental", False) or getattr(args, "resume", False) or getattr(args, "retry_failed", False)),
+        fallback="印象笔记",
+    )
     enex_dir = export_enex(args)
     return convert_enex(args, enex_dir)
 
@@ -793,6 +809,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--doc-id-file", default="", help="从文件读取要导出的笔记 GUID，JSON 数组或逐行文本均可")
     parser.add_argument("--incremental", action="store_true", help="已有 Markdown 文件时跳过")
     add_checkpoint_args(parser)
+    add_output_layout_args(parser)
     parser.add_argument("--force", action="store_true", help="重新初始化本地同步库")
     parser.add_argument("--no-sync", action="store_true", help="导出前不重新同步")
     parser.add_argument("--include-trash", action="store_true", help="包含废纸篓笔记")
@@ -827,6 +844,14 @@ def main(argv: list[str]) -> int:
         if args.convert_enex_only:
             if not args.enex_dir:
                 raise ExportError("--convert-enex-only 需要同时指定 --enex-dir")
+            args.output = resolve_output_directory(
+                args.output,
+                "印象笔记",
+                str(args.database),
+                auto_output_folder=bool(getattr(args, "auto_output_folder", False)),
+                preserve_legacy=bool(getattr(args, "incremental", False) or getattr(args, "resume", False) or getattr(args, "retry_failed", False)),
+                fallback="印象笔记",
+            )
             result = convert_enex(args, args.enex_dir)
             emit_json(result)
             return 0

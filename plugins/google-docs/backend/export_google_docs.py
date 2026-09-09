@@ -2,6 +2,13 @@
 """Export one authorized Google Docs document to Markdown with local resources."""
 from __future__ import annotations
 
+import sys as _sys
+from pathlib import Path as _Path
+
+_REPO_ROOT = _Path(__file__).resolve().parents[3]
+if str(_REPO_ROOT) not in _sys.path:
+    _sys.path.insert(0, str(_REPO_ROOT))
+
 import argparse
 import base64
 import binascii
@@ -28,6 +35,7 @@ from wandao_core.browser import (
     open_tab, sanitize_filename, start_chrome, wait_for_debug_port,
 )
 from wandao_core.report import finalize_report
+from wandao_core.output_layout import add_output_layout_args, resolve_output_directory
 
 PLUGIN_ID = "google-docs"
 PROVIDER_ID = "google-docs-export"
@@ -589,7 +597,7 @@ def save_attachment(ref: AttachmentRef, target_dir: Path, source_url: str, resou
     return relative
 
 
-def export_document_model(document: ExportedDocument, output: Path, title: str, *, source_url: str = ENTRY_URL, source: GoogleDocsSource | None = None, selected_node_ids: Iterable[str] | None = None, resource_files: dict[str, bytes] | None = None, progress_callback: Any | None = None, include_source: bool = False) -> dict[str, Any]:
+def export_document_model(document: ExportedDocument, output: Path, title: str, *, source_url: str = ENTRY_URL, source: GoogleDocsSource | None = None, selected_node_ids: Iterable[str] | None = None, resource_files: dict[str, bytes] | None = None, progress_callback: Any | None = None, include_source: bool = False, nested_document_dir: bool = True) -> dict[str, Any]:
     selected = [str(value) for value in (selected_node_ids or []) if str(value).strip()]
     if selected and source is None:
         raise GoogleDocsError("按目录导出时缺少 Google Docs 文档来源。")
@@ -598,7 +606,7 @@ def export_document_model(document: ExportedDocument, output: Path, title: str, 
         if selected and source is not None
         else render_markdown(document)
     )
-    document_dir = output / sanitize_filename(title, fallback="Google Docs 文档")
+    document_dir = output / sanitize_filename(title, fallback="Google Docs 文档") if nested_document_dir else output
     document_dir.mkdir(parents=True, exist_ok=True)
     image_paths: dict[int, str] = {}
     attachment_paths: dict[int, str] = {}
@@ -950,7 +958,9 @@ def scan_document(args: argparse.Namespace) -> dict[str, Any]:
 
 def export_document(args: argparse.Namespace) -> dict[str, Any]:
     source = parse_google_docs_url(args.source_url)
-    output = Path(args.output).expanduser().resolve()
+    output_root = Path(args.output).expanduser().resolve()
+    output = output_root
+    output_root.mkdir(parents=True, exist_ok=True)
     cdp = None
     process = None
     started = time.time()
@@ -961,6 +971,14 @@ def export_document(args: argparse.Namespace) -> dict[str, Any]:
         emit_progress(args, make_progress_payload(0, 1, 0, 0, 0, 0, "正在读取文档结构"))
         html_content, title = download_exported_html(cdp, source, args)
         document = parse_exported_html(html_content, title)
+        output = resolve_output_directory(
+            output_root,
+            document.title,
+            source.document_id,
+            auto_output_folder=bool(getattr(args, "auto_output_folder", False)),
+            preserve_legacy=bool(getattr(args, "incremental", False) or getattr(args, "resume", False) or getattr(args, "retry_failed", False)),
+            fallback="Google Docs 文档",
+        )
         emit_progress(args, make_progress_payload(0, 1, 0, 0, 0, 0, "正在读取正文"))
         result_data = export_document_model(
             document,
@@ -971,6 +989,7 @@ def export_document(args: argparse.Namespace) -> dict[str, Any]:
             selected_node_ids=args.node_id,
             progress_callback=lambda payload: emit_progress(args, payload),
             include_source=args.include_source,
+            nested_document_dir=not bool(getattr(args, "auto_output_folder", False)),
         )
         emit_progress(args, make_progress_payload(1, 1, result_data["imageCount"], result_data["imageSuccessCount"], result_data["attachmentCount"], result_data["attachmentSuccessCount"], "正在生成 Markdown"))
         report_path = Path(result_data["documentDir"]) / "00-导出报告.json"
@@ -1011,6 +1030,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--browser-path", default="", help="Chrome/Edge/Chromium executable path")
     parser.add_argument("--wait-seconds", type=int, default=300, help="Seconds to wait for login or page loading")
     parser.add_argument("--close-started-chrome", action="store_true", help="Close a browser started by this action")
+    add_output_layout_args(parser)
     args = parser.parse_args(argv)
     args.output = str(resolve_output_path(args.output))
     return args

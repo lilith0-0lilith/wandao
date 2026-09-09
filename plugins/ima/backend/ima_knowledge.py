@@ -12,6 +12,13 @@ download APIs.
 
 from __future__ import annotations
 
+import sys as _sys
+from pathlib import Path as _Path
+
+_REPO_ROOT = _Path(__file__).resolve().parents[3]
+if str(_REPO_ROOT) not in _sys.path:
+    _sys.path.insert(0, str(_REPO_ROOT))
+
 import argparse
 import base64
 import getpass
@@ -35,6 +42,7 @@ from pathlib import Path
 from typing import Any
 
 from wandao_core.checkpoint import add_checkpoint_args, open_checkpoint_from_args
+from wandao_core.output_layout import add_output_layout_args, resolve_output_directory
 from wandao_cli import extend_arg_list_from_file
 from wandao_core.logging import emit_legacy
 from wandao_core.report import finalize_report
@@ -918,9 +926,20 @@ def selected_entries(entries: list[KnowledgeEntry], doc_ids: list[str]) -> list[
 
 
 def export_selected(client: ImaClient, args: argparse.Namespace) -> dict[str, Any]:
-    output = Path(args.output or default_output_dir()).resolve()
+    output_root = Path(args.output or default_output_dir()).resolve()
     checkpoint = open_checkpoint_from_args(args, "ima", "export")
     kbs, entries = scan_remote_tree(client, args)
+    kb_ids = sorted({kb.id for kb in kbs})
+    source_name = kbs[0].name if len(kbs) == 1 else "ima 知识库"
+    source_id = kb_ids[0] if len(kb_ids) == 1 else "ima:" + ",".join(kb_ids)
+    output = resolve_output_directory(
+        output_root,
+        source_name,
+        source_id,
+        auto_output_folder=bool(getattr(args, "auto_output_folder", False)),
+        preserve_legacy=bool(getattr(args, "incremental", False) or getattr(args, "resume", False) or getattr(args, "retry_failed", False)),
+        fallback="ima 知识库",
+    )
     docs = selected_entries(entries, args.doc_id or [])
     if checkpoint:
         checkpoint.start_task(
@@ -1699,6 +1718,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--request-jitter", type=float, default=0.2, help="API 请求随机浮动秒")
     parser.add_argument("--progress-every", type=int, default=10, help="每处理多少条输出一次进度")
     add_checkpoint_args(parser)
+    add_output_layout_args(parser)
     args = parser.parse_args(argv)
     extend_arg_list_from_file(args, "doc_id")
     return args

@@ -12,6 +12,13 @@ The script never modifies the source Vault.
 
 from __future__ import annotations
 
+import sys as _sys
+from pathlib import Path as _Path
+
+_REPO_ROOT = _Path(__file__).resolve().parents[3]
+if str(_REPO_ROOT) not in _sys.path:
+    _sys.path.insert(0, str(_REPO_ROOT))
+
 import argparse
 import json
 import os
@@ -20,6 +27,8 @@ import shutil
 import sys
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
+
+from wandao_core.output_layout import add_output_layout_args, resolve_output_directory
 
 
 # ---------------------------------------------------------------------------
@@ -364,14 +373,24 @@ def export_cmd(
     doc_ids: Optional[List[str]],
     incremental: bool,
     progress_every: int,
+    auto_output_folder: bool = False,
+    preserve_legacy: bool = False,
 ) -> Dict[str, Any]:
     """Batch-export selected Markdown files from *vault* to *output*."""
 
     vault_abs = vault.resolve()
-    output_abs = output.resolve()
+    output_root = output.resolve()
 
     # Security: reject output directory inside vault
-    _validate_output_not_in_vault(output, vault)
+    _validate_output_not_in_vault(output_root, vault)
+    output_abs = resolve_output_directory(
+        output_root,
+        vault.name or "Obsidian Vault",
+        str(vault.resolve()),
+        auto_output_folder=auto_output_folder,
+        preserve_legacy=preserve_legacy,
+        fallback="Obsidian Vault",
+    )
 
     # Build and validate selection set
     if doc_ids:
@@ -540,6 +559,7 @@ def main() -> None:
     parser.add_argument("--doc-id", action="append", default=None, help="Relative path of file to export (repeatable)")
     parser.add_argument("--incremental", action="store_true", help="Skip files newer than output")
     parser.add_argument("--progress-every", type=int, default=1, help="Emit progress every N docs (0=off)")
+    add_output_layout_args(parser)
 
     args = parser.parse_args()
 
@@ -573,6 +593,8 @@ def main() -> None:
                 doc_ids=args.doc_id,
                 incremental=args.incremental,
                 progress_every=args.progress_every,
+                auto_output_folder=bool(getattr(args, "auto_output_folder", False)),
+                preserve_legacy=bool(getattr(args, "incremental", False)),
             )
         except ValueError as exc:
             result = {

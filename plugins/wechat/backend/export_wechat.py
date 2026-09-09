@@ -7,6 +7,13 @@ WeChat private APIs, collect article keys, or extract browser cookies.
 
 from __future__ import annotations
 
+import sys as _sys
+from pathlib import Path as _Path
+
+_REPO_ROOT = _Path(__file__).resolve().parents[3]
+if str(_REPO_ROOT) not in _sys.path:
+    _sys.path.insert(0, str(_REPO_ROOT))
+
 import argparse
 import hashlib
 import html
@@ -41,6 +48,7 @@ from wandao_core.browser import (
     wait_for_debug_port,
 )
 from wandao_core.checkpoint import add_checkpoint_args, open_checkpoint_from_args
+from wandao_core.output_layout import add_output_layout_args, resolve_output_directory
 from wandao_core.report import finalize_report
 
 
@@ -777,8 +785,9 @@ def markdown_path(output: Path, title: str, source: WeChatSource) -> Path:
 
 def export_wechat(args: argparse.Namespace) -> dict[str, Any]:
     source = parse_wechat_url(args.source_url)
-    output = Path(args.output).expanduser().resolve()
-    output.mkdir(parents=True, exist_ok=True)
+    output_root = Path(args.output).expanduser().resolve()
+    output = output_root
+    output_root.mkdir(parents=True, exist_ok=True)
     started = time.time()
     checkpoint = open_checkpoint_from_args(args, PROVIDER_ID, "export")
     cdp: CDPClient | None = None
@@ -813,6 +822,14 @@ def export_wechat(args: argparse.Namespace) -> dict[str, Any]:
         else:
             payload = wait_for_page_payload(cdp, source, args)
         title = str(payload.get("title") or "微信公众号文章").strip()
+        output = resolve_output_directory(
+            output_root,
+            title,
+            source.article_key,
+            auto_output_folder=bool(getattr(args, "auto_output_folder", False)),
+            preserve_legacy=bool(getattr(args, "incremental", False) or getattr(args, "resume", False) or getattr(args, "retry_failed", False)),
+            fallback="微信公众号文章",
+        )
         md_path = markdown_path(output, title, source)
         if args.incremental and md_path.exists() and markdown_matches_source(md_path, source):
             skipped = 1
@@ -892,6 +909,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--no-download-images", dest="download_images", action="store_false", help="保留正文图片的远程链接")
     parser.add_argument("--incremental", action="store_true", help="目标 Markdown 已存在时跳过")
     add_checkpoint_args(parser)
+    add_output_layout_args(parser)
     parser.add_argument("--port", type=int, default=DEFAULT_PORT, help="微信公众号专用 Chrome 调试端口")
     parser.add_argument("--profile-dir", default=str(default_profile_path()), help="微信公众号专用浏览器配置目录")
     parser.add_argument("--browser-path", default="", help="Chrome/Edge/Chromium 可执行文件路径")

@@ -32,6 +32,13 @@ Codex. Saved auth files contain session cookies, so keep them private.
 
 from __future__ import annotations
 
+import sys as _sys
+from pathlib import Path as _Path
+
+_REPO_ROOT = _Path(__file__).resolve().parents[3]
+if str(_REPO_ROOT) not in _sys.path:
+    _sys.path.insert(0, str(_REPO_ROOT))
+
 import argparse
 import base64
 import concurrent.futures
@@ -58,6 +65,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 from wandao_core.checkpoint import add_checkpoint_args, open_checkpoint_from_args
+from wandao_core.output_layout import add_output_layout_args, resolve_output_directory
 from wandao_cli import extend_arg_list_from_file
 from wandao_core.credentials import write_private_json
 from wandao_core.document_links import direct_document_reference
@@ -1871,8 +1879,9 @@ def scan_workspace_tree(args: argparse.Namespace) -> dict[str, Any]:
 def export_workspace(args: argparse.Namespace) -> dict[str, Any]:
     workspace_url = args.workspace_url
     workspace_id = args.workspace_id or extract_workspace_id(workspace_url)
-    output = Path(args.output).resolve()
-    output.mkdir(parents=True, exist_ok=True)
+    output_root = Path(args.output).resolve()
+    output = output_root
+    output_root.mkdir(parents=True, exist_ok=True)
     checkpoint = open_checkpoint_from_args(args, "aliyun-thoughts", "export")
 
     auth_file = auth_path_from_args(args)
@@ -1910,6 +1919,16 @@ def export_workspace(args: argparse.Namespace) -> dict[str, Any]:
         elif args.wait_login:
             ensure_cdp()
 
+        root_nodes = [node for node in nodes if not node.parent_id]
+        source_node = root_nodes[0] if len(root_nodes) == 1 else None
+        output = resolve_output_directory(
+            output_root,
+            str(getattr(args, "workspace_name", "") or (source_node.title if source_node else f"阿里云 Thoughts {workspace_id}")),
+            workspace_id,
+            auto_output_folder=bool(getattr(args, "auto_output_folder", False)),
+            preserve_legacy=bool(getattr(args, "incremental", False) or getattr(args, "resume", False) or getattr(args, "retry_failed", False)),
+            fallback="阿里云 Thoughts",
+        )
         by_id = {node.id: node for node in nodes}
         folder_paths, planned_doc_paths, children, root_items = build_paths(nodes, output)
 
@@ -2629,6 +2648,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--incremental", action="store_true", help="Only export documents missing from local Markdown")
     parser.add_argument("--update-existing", action="store_true", help="With --incremental, update existing documents too")
     add_checkpoint_args(parser)
+    add_output_layout_args(parser)
     parser.add_argument("--doc-id", action="append", dest="selected_doc_ids", help="Export one specific document id, repeatable")
     parser.add_argument("--doc-id-file", default="", help="Read selected document ids from a JSON array/object or line-based text file")
     parser.add_argument("--render-timeout", type=int, default=20, help="Seconds to wait for each document render")

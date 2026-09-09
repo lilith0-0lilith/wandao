@@ -24,6 +24,13 @@ cookies, not passwords. Keep auth files private.
 
 from __future__ import annotations
 
+import sys as _sys
+from pathlib import Path as _Path
+
+_REPO_ROOT = _Path(__file__).resolve().parents[3]
+if str(_REPO_ROOT) not in _sys.path:
+    _sys.path.insert(0, str(_REPO_ROOT))
+
 import argparse
 import base64
 import hashlib
@@ -62,6 +69,7 @@ from wandao_core.browser import (
     wait_for_debug_port,
 )
 from wandao_core.checkpoint import add_checkpoint_args, open_checkpoint_from_args
+from wandao_core.output_layout import add_output_layout_args, resolve_output_directory
 from wandao_cli import extend_arg_list_from_file
 from wandao_core.credentials import write_private_json
 from wandao_core.report import finalize_report
@@ -2760,8 +2768,9 @@ def scan_wiki_toc(args: argparse.Namespace) -> dict[str, Any]:
 
 def export_wiki(args: argparse.Namespace) -> dict[str, Any]:
     host, origin, start_token, wiki_url, entry_kind = parse_feishu_entry_url(args.wiki_url)
-    output = Path(args.output).resolve()
-    output.mkdir(parents=True, exist_ok=True)
+    output_root = Path(args.output).resolve()
+    output = output_root
+    output_root.mkdir(parents=True, exist_ok=True)
     checkpoint = open_checkpoint_from_args(args, "feishu", "export")
     cdp, chrome_proc = (
         connect_wiki_browser(args, wiki_url, host, start_token)
@@ -2818,6 +2827,17 @@ def export_wiki(args: argparse.Namespace) -> dict[str, Any]:
                 "nodes": {start_token: node},
             }
             ordered = [node]
+        space = tree.get("space") or {}
+        source_name = str(space.get("space_name") or tree.get("title") or ordered[0].get("title") or "飞书文档").strip()
+        source_id = str(tree.get("spaceId") or start_token or wiki_url)
+        output = resolve_output_directory(
+            output_root,
+            source_name,
+            source_id,
+            auto_output_folder=bool(getattr(args, "auto_output_folder", False)),
+            preserve_legacy=bool(getattr(args, "incremental", False) or getattr(args, "resume", False) or getattr(args, "retry_failed", False)),
+            fallback="飞书文档",
+        )
         selected_doc_ids = set(getattr(args, "selected_doc_ids", None) or [])
         docs = select_exportable_docs(ordered, selected_doc_ids)
         doc_paths = build_doc_paths(ordered, tree, output)
@@ -3561,6 +3581,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--incremental", action="store_true", help="Only export documents missing from local Markdown")
     parser.add_argument("--update-existing", action="store_true", help="With --incremental, update existing documents too")
     add_checkpoint_args(parser)
+    add_output_layout_args(parser)
     parser.add_argument("--doc-id", action="append", dest="selected_doc_ids", help="Export one specific wiki token, repeatable")
     parser.add_argument("--doc-id-file", default="", help="Read selected wiki tokens from a JSON array/object or line-based text file")
     parser.add_argument("--download-timeout", type=int, default=45, help="Seconds to wait for each image download")

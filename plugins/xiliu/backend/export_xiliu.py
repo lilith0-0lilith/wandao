@@ -25,6 +25,13 @@ Export:
 
 from __future__ import annotations
 
+import sys as _sys
+from pathlib import Path as _Path
+
+_REPO_ROOT = _Path(__file__).resolve().parents[3]
+if str(_REPO_ROOT) not in _sys.path:
+    _sys.path.insert(0, str(_REPO_ROOT))
+
 import argparse
 import gzip
 import hashlib
@@ -43,6 +50,7 @@ from pathlib import Path
 from typing import Any
 
 from wandao_core.checkpoint import add_checkpoint_args, open_checkpoint_from_args
+from wandao_core.output_layout import add_output_layout_args, resolve_output_directory
 from wandao_core.logging import emit_legacy
 from wandao_core.credentials import write_private_json
 from wandao_core.report import finalize_report
@@ -895,12 +903,21 @@ def _export_flowus_impl(args: argparse.Namespace, checkpoint: Any) -> dict[str, 
     url = args.doc_url
     if not url:
         raise FlowUsError("--doc-url is required for export")
-    output = Path(args.output).expanduser().resolve() if args.output else Path.cwd() / "exports" / "flowus"
+    output_root = Path(args.output).expanduser().resolve() if args.output else Path.cwd() / "exports" / "flowus"
     doc_id = parse_flowus_url(url)
     emit("开始导出 FlowUs 文档")
 
     tree_failures: list[dict[str, Any]] = []
     all_nodes = build_toc_tree(client, doc_id, failures=tree_failures, args=args)
+    source_node = all_nodes[0] if all_nodes else None
+    output = resolve_output_directory(
+        output_root,
+        source_node.title if source_node else "FlowUs 文档",
+        source_node.id if source_node else doc_id,
+        auto_output_folder=bool(getattr(args, "auto_output_folder", False)),
+        preserve_legacy=bool(getattr(args, "incremental", False) or getattr(args, "resume", False) or getattr(args, "retry_failed", False)),
+        fallback="FlowUs 文档",
+    )
     full_node_map = {node.id: node for node in all_nodes}
     components = _stable_output_components(all_nodes)
     selected_ids = set(getattr(args, "selected_doc_ids", None) or [])
@@ -1139,6 +1156,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--retry", type=int, default=2, help="网络请求失败时的重试次数")
     parser.add_argument("--doc-id", action="append", dest="selected_doc_ids", help="只导出指定文档 ID，可重复")
     add_checkpoint_args(parser)
+    add_output_layout_args(parser)
     return parser.parse_args(argv)
 
 

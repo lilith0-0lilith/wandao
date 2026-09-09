@@ -18,7 +18,8 @@
   "toc": { "itemsPath": "nodes", "idKey": "id", "exportIdKey": "id", "titleKey": "title", "parentIdKey": "parent_id", "typeKey": "type", "selectableTypes": ["document"], "selectionArg": "--doc-id", "selectableWhenExportId": true },
   "fields": [
     { "name": "workspace_url", "label": "Thoughts 工作区 URL", "type": "text", "arg": "--workspace-url", "required": true, "history": "url", "actions": ["login", "scan", "export"] },
-    { "name": "output", "label": "输出目录", "type": "directory", "arg": "--output", "required": true, "history": "path", "actions": ["export"] },
+    { "name": "output", "label": "导出根目录", "type": "directory", "arg": "--output", "required": true, "history": "path", "actions": ["export"] },
+    { "name": "auto_output_folder", "label": "按来源自动创建子文件夹", "type": "checkbox", "arg": "--auto-output-folder", "falseArg": "--flat-output", "default": true, "actions": ["export"] },
     { "name": "include_source", "label": "显示来源链接", "type": "checkbox", "arg": "--include-source", "falseArg": "--no-source", "default": true, "actions": ["export"] },
     { "name": "incremental", "label": "增量导出", "type": "checkbox", "arg": "--incremental", "default": true, "advanced": true, "actions": ["export"] },
     { "name": "update_existing", "label": "更新已有文档", "type": "checkbox", "arg": "--update-existing", "default": false, "advanced": true, "actions": ["export"] },

@@ -64,11 +64,20 @@
     },
     {
       "name": "output",
-      "label": "输出目录",
+      "label": "导出根目录",
       "type": "directory",
       "arg": "--output",
       "required": true,
       "history": "path",
+      "actions": ["export"]
+    },
+    {
+      "name": "auto_output_folder",
+      "label": "按来源自动创建子文件夹",
+      "type": "checkbox",
+      "arg": "--auto-output-folder",
+      "falseArg": "--flat-output",
+      "default": true,
       "actions": ["export"]
     },
     {
