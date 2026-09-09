@@ -222,7 +222,7 @@ test('historical task rendering normalizes legacy reports and keeps startup inde
   assert.doesNotMatch(normalizedReport, /if \(task\?\.report\?\.stats\) return task\.report/);
   assert.match(normalizedReport, /imageFailures: \[\]/);
   assert.match(normalizedReport, /attachmentFailures: \[\]/);
-  assert.match(taskDetails, /const documentFailures = Array\.isArray\(report\.documentFailures\)/);
+  assert.match(taskDetails, /const \{ document: documentFailures, image: imageFailures, attachment: attachmentFailures, resource: otherResourceFailures \} = taskFailureGroups\(task\)/);
   assert.match(taskDetails, /renderTaskFailureDetails\('图片失败', imageFailures, 'image', 12, \{ providerId: task\.providerId \}\)/);
   assert.match(appPaths, /try \{\s*await loadTaskHistory\(\);\s*\} catch \(error\)/);
   assert.match(appPaths, /平台页面仍可正常打开/);

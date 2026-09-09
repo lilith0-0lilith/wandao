@@ -226,11 +226,13 @@ test('task-center failure links open outside the application WebView', () => {
 test('non-Wiz failures with a verified page URL provide a source locator', () => {
   const appJs = fs.readFileSync('wandao_electron/renderer/app.js', 'utf8');
   const details = appJs.slice(appJs.indexOf('function renderTaskFailureDetails'), appJs.indexOf('function renderTaskErrorProtocol'));
+  const failureItem = appJs.slice(appJs.indexOf('function renderTaskFailureItem'), appJs.indexOf('function renderTaskFailureDetails'));
   const actions = appJs.slice(appJs.indexOf('async function locateSourcePage'), appJs.indexOf('function startHistoryTask'));
 
-  assert.match(details, /options\.providerId !== 'wiz'/);
-  assert.match(details, /data-history-action="locate-source-page"/);
-  assert.match(details, /定位到原文/);
+  assert.match(failureItem, /providerId !== 'wiz'/);
+  assert.match(failureItem, /data-history-action="locate-source-page"/);
+  assert.match(failureItem, /定位到原文/);
+  assert.match(details, /renderTaskFailureItem\(item, options\.providerId\)/);
   assert.match(actions, /window\.electronAPI\.openExternal\(sourceUrl\)/);
 });
 
